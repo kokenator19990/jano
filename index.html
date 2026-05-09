@@ -879,7 +879,7 @@
             Cámara
           </button>
         </div>
-        <span class="av-mesh-label">FACIAL LANDMARK MESH · v4.0</span>
+        <span class="av-mesh-label">FACIAL LANDMARK MESH · v6.0</span>
       </div>
 
     </div>
@@ -1550,6 +1550,14 @@
   // Init Three.js scene
   const canvas = document.getElementById('avatarCanvas');
   init(canvas);
+
+  // DEBUG: Auto-load prueba1.png
+  setTimeout(() => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => applyPhoto(img);
+    img.src = 'prueba1.png';
+  }, 1000);
 
   // Preset switching
   document.querySelectorAll('.av-preset-btn').forEach(btn => {

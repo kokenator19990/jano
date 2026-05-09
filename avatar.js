@@ -50,9 +50,9 @@ export const PRESETS = [
 ];
 
 const TARGET_H     = 2.2;
-const FACE_W_RATIO = 0.38;   // La cara ocupa ~38% del ancho total del busto
-const FACE_H_RATIO = 0.35;   // La cara ocupa ~35% del alto total del busto
-const FACE_Z_RATIO = 0.35;   // Amplificador de profundidad Z
+const FACE_W_RATIO = 0.52;   // Ajustado para cubrir perfectamente la cara del maniquí
+const FACE_H_RATIO = 0.50;   
+const FACE_Z_RATIO = 0.50;
 
 // Contorno oval de la cara (36 índices de MediaPipe FaceLandmarker)
 const FACE_OVAL = [
@@ -124,8 +124,8 @@ export function init(canvas) {
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
   
-  // Bloom for glowing biometric nodes
-  const bloomPass = new UnrealBloomPass(new THREE.Vector2(W, H), 1.8, 0.45, 1.5);
+  // Bloom for glowing biometric nodes (Threshold alto para que la piel NO brille)
+  const bloomPass = new UnrealBloomPass(new THREE.Vector2(W, H), 1.6, 0.45, 3.0);
   composer.addPass(bloomPass);
 
   // Depth of Field (BokehPass) for cinematic photography look
@@ -260,18 +260,22 @@ function _buildFaceMesh(landmarks, imgEl) {
   const faceHN  = Math.max(ly1 - ly0, 0.01);
 
   // ── 2. Escala y Centrado Absoluto sobre el Maniquí Base ──
-  const scaleX = (_modelSize.x * FACE_W_RATIO) / faceWN;
-  const scaleY = (_modelSize.y * FACE_H_RATIO) / faceHN;
+  // En lugar de depender del ancho de los hombros, usamos un tamaño de rostro absoluto
+  const TARGET_FACE_W = 1.75; 
+  const TARGET_FACE_H = 2.25; 
+  
+  const scaleX = TARGET_FACE_W / faceWN;
+  const scaleY = TARGET_FACE_H / faceHN;
   const uniformScale = (scaleX + scaleY) / 2;
-  const scaleZ = uniformScale * 1.6; // Profundidad volumétrica facial
+  const scaleZ = uniformScale * 1.5; // Profundidad volumétrica facial
   
   const positions = new Float32Array(N * 3);
   const uvs       = new Float32Array(N * 2);
   
   // Posicionar exactamente en el "frente" de la cabeza del maniquí
   const wCX = 0;
-  const wCY = _modelSize.y * 0.22; // La cara está en la mitad superior del busto
-  const baseZ = _modelSize.z * 0.45; // Empujarlo al frente del volumen 3D
+  const wCY = 0.20; // Elevación de la cara respecto al centro del busto (0,0,0)
+  const baseZ = 0.28; // Profundidad para encajar justo sobre la malla base
 
   for (let i = 0; i < N; i++) {
     const lm = landmarks[i];
@@ -347,7 +351,7 @@ function _buildFaceMesh(landmarks, imgEl) {
   else scene.add(mesh);
 
   // ── Añadir UI Biométrica Holográfica ──
-  const ui = _buildLandmarkOverlay(geo);
+  const ui = _buildLandmarkOverlay(geo, positions);
   if (ui) {
     ui.name = 'biometricUI';
     if (head) head.add(ui);
@@ -398,9 +402,13 @@ function _blendBaseHeadSkin(imgEl, landmarks, wCX, wCY, scaleX, scaleY) {
       const mats = Array.isArray(o.material) ? o.material : [o.material];
       mats.forEach(m => {
         if (!m) return;
-        m.map = null; // Remover la textura "maniquí" azul/gris
+        m.map = null; // Remover textura
+        if (m.emissive) m.emissive.setHex(0x000000);
+        m.vertexColors = false; 
+        
         m.color.copy(skinColor); // Color piel promedio perfecto
         m.roughness = 0.65;
+        m.metalness = 0.1;
         m.needsUpdate = true;
       });
     }
@@ -838,19 +846,19 @@ function _addLights() {
   scene.add(_hemLight);
 
   // Key light (frontal cálido cinematográfico)
-  const key = new THREE.DirectionalLight(0xFFE8D6, 5.0);
+  const key = new THREE.DirectionalLight(0xFFE8D6, 2.5);
   key.position.set(-3, 4, 6);
   key.castShadow = true;
   key.shadow.mapSize.set(2048, 2048);
   scene.add(key);
 
   // Fill (lateral frío)
-  const fill = new THREE.DirectionalLight(0xAACCF5, 2.0);
+  const fill = new THREE.DirectionalLight(0xAACCF5, 1.2);
   fill.position.set(4, 0, 3);
   scene.add(fill);
 
   // Rim Light Agresivo (contraluz espectacular Cyan/Frío)
-  const rim = new THREE.DirectionalLight(0x66FFFF, 8.0);
+  const rim = new THREE.DirectionalLight(0x66FFFF, 4.0);
   rim.position.set(5, 3, -5);
   scene.add(rim);
 
@@ -862,40 +870,77 @@ function _addLights() {
 
 // ─── OVERLAY HOLOGRÁFICO DE LANDMARKS ────────────────────────
 //
-//  Genera una red biométrica estilo Sci-Fi (Cyan) usando 
-//  los 468 nodos anatómicos proyectados por MediaPipe.
+//  Genera una red biométrica estilo Sci-Fi (Cyan) limpia y minimalista,
+//  idéntica a la imagen de referencia.
 //
-function _buildLandmarkOverlay(geo) {
-  if (!geo) return null;
+function _buildLandmarkOverlay(geo, positionsArray) {
+  if (!geo || !positionsArray) return null;
 
   const group = new THREE.Group();
 
-  // 1. Nodos Biométricos (Cyan Bloom)
+  // 1. Extraer subconjunto de nodos para un look "limpio" (aprox 40 puntos)
+  const sparseIndices = [
+    10, 109, 338, 21, 251, 33, 263, 1, 61, 291, 152, 234, 454,
+    103, 332, 67, 297, 101, 330, 50, 280, 119, 348, 147, 376,
+    205, 425, 207, 427, 214, 434, 212, 432, 138, 367, 135, 364
+  ];
+
+  const sparsePositions = [];
+  sparseIndices.forEach(idx => {
+    sparsePositions.push(
+      positionsArray[idx * 3],
+      positionsArray[idx * 3 + 1],
+      positionsArray[idx * 3 + 2]
+    );
+  });
+
+  const pGeo = new THREE.BufferGeometry();
+  pGeo.setAttribute('position', new THREE.Float32BufferAttribute(sparsePositions, 3));
+
+  // Nodos Biométricos (Cyan Bloom)
   const dotMat = new THREE.PointsMaterial({
     color: 0x00FFFF, 
-    size: 0.015,
+    size: 0.012,
     transparent: true,
-    opacity: 0.9,
+    opacity: 0.95,
     blending: THREE.AdditiveBlending, 
     depthWrite: false
   });
-  const dots = new THREE.Points(geo, dotMat);
+  const dots = new THREE.Points(pGeo, dotMat);
   group.add(dots);
 
-  // 2. Wireframe / Red Geométrica
+  // 2. Crear conexiones (Wireframe) calculando vecinos cercanos
+  const edges = [];
+  const MAX_DIST = 0.45; // Conectar si están relativamente cerca
+  
+  for (let i = 0; i < sparseIndices.length; i++) {
+    const x1 = sparsePositions[i*3], y1 = sparsePositions[i*3+1], z1 = sparsePositions[i*3+2];
+    let connected = 0;
+    for (let j = i + 1; j < sparseIndices.length; j++) {
+      const x2 = sparsePositions[j*3], y2 = sparsePositions[j*3+1], z2 = sparsePositions[j*3+2];
+      const dist = Math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2);
+      if (dist < MAX_DIST && connected < 3) {
+        edges.push(x1, y1, z1, x2, y2, z2);
+        connected++;
+      }
+    }
+  }
+
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(edges, 3));
+  
   const wireMat = new THREE.LineBasicMaterial({
     color: 0x00FFFF,
     transparent: true,
-    opacity: 0.25,
+    opacity: 0.4,
     blending: THREE.AdditiveBlending,
     depthWrite: false
   });
   
-  const wireGeo = new THREE.WireframeGeometry(geo);
-  const wire = new THREE.LineSegments(wireGeo, wireMat);
+  const wire = new THREE.LineSegments(lineGeo, wireMat);
   group.add(wire);
 
-  // Pequeño offset Z para evitar Z-Fighting con la piel
+  // Pequeño offset Z para evitar Z-Fighting
   group.position.z += 0.005;
 
   return group;
