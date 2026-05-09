@@ -291,17 +291,18 @@ function _buildFaceMesh(landmarks, imgEl) {
     const fy = -(lm.y - faceCyN);
     const fz = -lm.z; // Profundidad relativa
     
-    // Aplicar escala y offset
+    // Peso de profundidad radial: plena en centro, atenuada en bordes
+    const ndx = (lm.x - faceCxN) / (faceWN * 0.5);
+    const ndy = (lm.y - faceCyN) / (faceHN * 0.5);
+    const dw  = Math.max(0, 1.0 - Math.sqrt(ndx * ndx + ndy * ndy) * 0.6);
+
     positions[i * 3 + 0] = fx * scaleX + wCX;
     positions[i * 3 + 1] = fy * scaleY + wCY;
-    positions[i * 3 + 2] = fz * scaleZ + baseZ;
+    positions[i * 3 + 2] = fz * scaleZ * dw + baseZ;
 
     uvs[i * 2 + 0] = lm.x;
     uvs[i * 2 + 1] = lm.y;
   }
-
-  // ── Raycasting: conformar Z a la superficie del cráneo ──
-  _conformToSurface(positions, N, landmarks, scaleZ);
 
   // ── Geometría ─────────────────────────────────────────────
   let geo = new THREE.BufferGeometry();
