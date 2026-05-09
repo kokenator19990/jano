@@ -51,6 +51,13 @@ const FACE_W_RATIO = 0.88;   // cara ocupa ~88 % del ancho de la cabeza
 const FACE_H_RATIO = 0.70;   // cara ocupa ~70 % del alto de la cabeza
 const FACE_Z_RATIO = 0.44;   // superficie frontal de la cabeza
 
+// Contorno oval de la cara (36 índices de MediaPipe FaceLandmarker)
+const FACE_OVAL = [
+  10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+  397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+  172,  58, 132,  93, 234, 127, 162,  21,  54, 103,  67, 109,
+];
+
 // ─── ESTADO DEL RENDERER ─────────────────────────────────────
 let scene, camera, renderer, composer, controls, clock;
 let head          = null;
@@ -302,9 +309,19 @@ function _buildFaceMesh(landmarks, imgEl) {
   photoTex.magFilter   = THREE.LinearFilter;
   photoTex.needsUpdate = true;
 
+  // ── Alpha map (contorno oval difuminado) ────────────────────
+  const alphaTex = _buildAlphaMap(landmarks);
+
+  // ── Normal map (detalle superficial desde foto) ─────────────
+  const normalTex = _buildNormalMap(imgEl);
+
   // ── Material PBR — polygonOffset evita z-fighting ─────────
   const mat = new THREE.MeshStandardMaterial({
     map:                 photoTex,
+    alphaMap:            alphaTex,
+    normalMap:           normalTex,
+    normalScale:         new THREE.Vector2(0.4, 0.4),
+    transparent:         true,   // requerido para que alphaMap funcione
     side:                THREE.FrontSide,
     roughness:           0.72,
     metalness:           0.0,
@@ -382,7 +399,17 @@ function _applyGeminiEnhancement(analysis) {
     _faceMesh3D.material.needsUpdate = true;
   }
 
-  // ── 3. Ajuste de iluminación ambiental al tono de piel ───────
+  // ── 3. Escala de normal map según prominencia 3D del paciente ─
+  if (_faceMesh3D.material?.normalScale) {
+    const np = dep.noseProminence      ?? 0.5;
+    const br = dep.browRidge           ?? 0.3;
+    const cp = dep.cheekboneProminence ?? 0.5;
+    const ns = THREE.MathUtils.clamp((np + br + cp) / 3, 0.15, 0.75);
+    _faceMesh3D.material.normalScale.set(ns, ns);
+    _faceMesh3D.material.needsUpdate = true;
+  }
+
+  // ── 4. Ajuste de iluminación ambiental al tono de piel ───────
   if (skin.primaryColor && _hemLight) {
     const skinColor  = new THREE.Color(skin.primaryColor);
     const warmth     = skin.warmth ?? 0.5;
@@ -396,7 +423,7 @@ function _applyGeminiEnhancement(analysis) {
     }
   }
 
-  // ── 4. Escala del modelo base (proporciones de Gemini) ───────
+  // ── 5. Escala del modelo base (proporciones de Gemini) ───────
   if (prop.faceAspect && head) {
     // faceAspect = alto/ancho de cara. Más alto que 1.3 → cara más larga.
     const aspect     = THREE.MathUtils.clamp(prop.faceAspect, 0.85, 1.85);
@@ -520,9 +547,194 @@ function _removeFaceMesh() {
   const mat = _faceMesh3D.material;
   if (mat) {
     mat.map?.dispose();
+    mat.alphaMap?.dispose();
+    mat.normalMap?.dispose();
     mat.dispose();
   }
   _faceMesh3D = null;
+}
+
+// ─── ALPHA MAP (máscara oval con feathering) ──────────────────
+//
+//  Dibuja el contorno FACE_OVAL como polígono relleno en un
+//  canvas 128 × 128, luego aplica box-blur separable para
+//  suavizar los bordes. Three.js lee el canal R como alfa.
+//
+function _buildAlphaMap(landmarks) {
+  const AW = 128, AH = 128;
+  const c = document.createElement('canvas');
+  c.width = AW; c.height = AH;
+  const ctx = c.getContext('2d');
+
+  // Fondo negro (transparente)
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, AW, AH);
+
+  // Polígono oval → blanco (opaco)
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  FACE_OVAL.forEach((idx, i) => {
+    const lm = landmarks[idx];
+    // Coordenadas de canvas: igual que imagen origen (y hacia abajo)
+    const px = lm.x * AW;
+    const py = lm.y * AH;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  });
+  ctx.closePath();
+  ctx.fill();
+
+  // Box-blur separable (radio 4, 3 pasadas) → bordes difuminados
+  _boxBlurCanvasCtx(ctx, AW, AH, 4, 3);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.flipY     = false;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// ─── NORMAL MAP (Sobel sobre foto en escala de grises) ────────
+//
+//  Reduce la foto a max 512 px, convierte a grises, aplica blur
+//  y Sobel para obtener gradientes de superficie aproximados.
+//  Resultado: mapa de normales tangentes que añade detalle 3D.
+//
+//  CRÍTICO: colorSpace = LinearSRGBColorSpace (no SRGB) para no
+//  corromper los vectores normales con corrección de gamma.
+//
+function _buildNormalMap(imgEl) {
+  const MAX = 512;
+  const W0 = imgEl.naturalWidth  || imgEl.width  || 640;
+  const H0 = imgEl.naturalHeight || imgEl.height || 480;
+  const sc = Math.min(1, MAX / Math.max(W0, H0));
+  const W  = Math.round(W0 * sc);
+  const H  = Math.round(H0 * sc);
+
+  // Dibujar foto reducida
+  const srcC = document.createElement('canvas');
+  srcC.width = W; srcC.height = H;
+  srcC.getContext('2d').drawImage(imgEl, 0, 0, W, H);
+
+  // Convertir a grises Float32
+  const rgba = srcC.getContext('2d').getImageData(0, 0, W, H).data;
+  const gray = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    gray[i] = (0.299 * rgba[i * 4] + 0.587 * rgba[i * 4 + 1] + 0.114 * rgba[i * 4 + 2]) / 255;
+  }
+
+  // Box-blur antes de Sobel (reduce ruido de piel/JPEG)
+  const blurred = _boxBlurGray(gray, W, H, 3, 3);
+
+  // Sobel → normal map
+  const dstC = document.createElement('canvas');
+  dstC.width = W; dstC.height = H;
+  const dctx = dstC.getContext('2d');
+  const imgD = dctx.createImageData(W, H);
+  const d    = imgD.data;
+  const STR  = 3.0; // amplitud del gradiente
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const x0 = Math.max(0, x - 1), x1 = Math.min(W - 1, x + 1);
+      const y0 = Math.max(0, y - 1), y1 = Math.min(H - 1, y + 1);
+
+      // Kernel Sobel 3 × 3
+      const gx = (
+        -blurred[y0 * W + x0] - 2 * blurred[y * W + x0] - blurred[y1 * W + x0]
+        +blurred[y0 * W + x1] + 2 * blurred[y * W + x1] + blurred[y1 * W + x1]
+      );
+      const gy = (
+        -blurred[y0 * W + x0] - 2 * blurred[y0 * W + x] - blurred[y0 * W + x1]
+        +blurred[y1 * W + x0] + 2 * blurred[y1 * W + x] + blurred[y1 * W + x1]
+      );
+
+      // Normal tangente: nx=-Gx, ny=Gy, nz=1, normalizar
+      const nx = -gx * STR;
+      const ny =  gy * STR;
+      const nz = 1.0;
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      const idx = (y * W + x) * 4;
+      d[idx]     = Math.round((nx / len * 0.5 + 0.5) * 255); // R
+      d[idx + 1] = Math.round((ny / len * 0.5 + 0.5) * 255); // G
+      d[idx + 2] = Math.round((nz / len * 0.5 + 0.5) * 255); // B
+      d[idx + 3] = 255;
+    }
+  }
+  dctx.putImageData(imgD, 0, 0);
+
+  const tex = new THREE.CanvasTexture(dstC);
+  tex.colorSpace = THREE.LinearSRGBColorSpace; // vectores, NO gamma
+  tex.flipY      = false;
+  tex.minFilter  = THREE.LinearFilter;
+  tex.magFilter  = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// ─── BOX BLUR — canvas RGBA (canal R como escala de grises) ───
+function _boxBlurCanvasCtx(ctx, W, H, radius, passes) {
+  for (let p = 0; p < passes; p++) {
+    const img = ctx.getImageData(0, 0, W, H);
+    const src = img.data;
+    const hBuf = new Uint8ClampedArray(W * H);
+    const vBuf = new Uint8ClampedArray(W * H);
+
+    // Horizontal
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        let s = 0, n = 0;
+        for (let dx = -radius; dx <= radius; dx++) {
+          s += src[(y * W + Math.min(W - 1, Math.max(0, x + dx))) * 4];
+          n++;
+        }
+        hBuf[y * W + x] = s / n;
+      }
+    }
+    // Vertical
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        let s = 0, n = 0;
+        for (let dy = -radius; dy <= radius; dy++) {
+          s += hBuf[Math.min(H - 1, Math.max(0, y + dy)) * W + x];
+          n++;
+        }
+        vBuf[y * W + x] = s / n;
+      }
+    }
+    for (let i = 0; i < W * H; i++) {
+      const v = vBuf[i];
+      src[i * 4] = src[i * 4 + 1] = src[i * 4 + 2] = src[i * 4 + 3] = v;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+}
+
+// ─── BOX BLUR — array de grises Float32 ───────────────────────
+function _boxBlurGray(src, W, H, radius, passes) {
+  const a = src.slice();
+  const t = new Float32Array(W * H);
+  for (let p = 0; p < passes; p++) {
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        let s = 0, n = 0;
+        for (let dx = -radius; dx <= radius; dx++) {
+          s += a[y * W + Math.min(W - 1, Math.max(0, x + dx))]; n++;
+        }
+        t[y * W + x] = s / n;
+      }
+    }
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        let s = 0, n = 0;
+        for (let dy = -radius; dy <= radius; dy++) {
+          s += t[Math.min(H - 1, Math.max(0, y + dy)) * W + x]; n++;
+        }
+        a[y * W + x] = s / n;
+      }
+    }
+  }
+  return a;
 }
 
 // ─── ILUMINACIÓN ─────────────────────────────────────────────
