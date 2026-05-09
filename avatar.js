@@ -45,7 +45,7 @@ try {
 
 // ─── PRESETS ─────────────────────────────────────────────────
 export const PRESETS = [
-  { id: 0, label: 'Avatar A', sublabel: 'Femenino',  modelUrl: './models/head_female.glb' },
+  { id: 0, label: 'Avatar A', sublabel: 'Femenino',  modelUrl: './models/head_male.glb' },
   { id: 1, label: 'Avatar B', sublabel: 'Masculino', modelUrl: './models/head_male.glb'   },
 ];
 
