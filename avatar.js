@@ -49,10 +49,10 @@ export const PRESETS = [
   { id: 1, label: 'Avatar B', sublabel: 'Masculino', modelUrl: './models/head_male.glb'   },
 ];
 
-const TARGET_H   = 2.2;
-const FACE_W_RATIO = 0.88;   // cara ocupa ~88 % del ancho de la cabeza
-const FACE_H_RATIO = 0.70;   // cara ocupa ~70 % del alto de la cabeza
-const FACE_Z_RATIO = 0.44;   // superficie frontal de la cabeza
+const TARGET_H     = 2.2;
+const FACE_W_RATIO = 0.38;   // La cara ocupa ~38% del ancho total del busto
+const FACE_H_RATIO = 0.35;   // La cara ocupa ~35% del alto total del busto
+const FACE_Z_RATIO = 0.35;   // Amplificador de profundidad Z
 
 // Contorno oval de la cara (36 índices de MediaPipe FaceLandmarker)
 const FACE_OVAL = [
@@ -259,27 +259,32 @@ function _buildFaceMesh(landmarks, imgEl) {
   const faceWN  = Math.max(lx1 - lx0, 0.01);
   const faceHN  = Math.max(ly1 - ly0, 0.01);
 
-  // ── Escala XY ─────────────────────────────────────────────
+  // ── 2. Escala y Centrado Absoluto sobre el Maniquí Base ──
   const scaleX = (_modelSize.x * FACE_W_RATIO) / faceWN;
   const scaleY = (_modelSize.y * FACE_H_RATIO) / faceHN;
   const uniformScale = (scaleX + scaleY) / 2;
-  const scaleZ = uniformScale * 1.5; // Amplificador de profundidad (volumen)
-  const wCX = _modelCenter.x;
-  const wCY = _modelCenter.y + _modelSize.y * 0.06;
-
-  // ── Calcular XYZ reales (Geometría Intrínseca) ───────────
+  const scaleZ = uniformScale * 1.6; // Profundidad volumétrica facial
+  
   const positions = new Float32Array(N * 3);
   const uvs       = new Float32Array(N * 2);
-
-  // Z base del rostro (frente de la cabeza)
-  const baseZ = _modelCenter.z + _modelSize.z * 0.42;
+  
+  // Posicionar exactamente en el "frente" de la cabeza del maniquí
+  const wCX = 0;
+  const wCY = _modelSize.y * 0.22; // La cara está en la mitad superior del busto
+  const baseZ = _modelSize.z * 0.45; // Empujarlo al frente del volumen 3D
 
   for (let i = 0; i < N; i++) {
     const lm = landmarks[i];
-    positions[i * 3 + 0] = (lm.x - faceCxN) * scaleX + wCX;
-    positions[i * 3 + 1] = -(lm.y - faceCyN) * scaleY + wCY;
-    // La profundidad real de MediaPipe (lm.z negativo es hacia afuera)
-    positions[i * 3 + 2] = baseZ + (-lm.z * scaleZ);
+    
+    // Centrar los vértices en 0,0,0
+    const fx = lm.x - faceCxN;
+    const fy = -(lm.y - faceCyN);
+    const fz = -lm.z; // Profundidad relativa
+    
+    // Aplicar escala y offset
+    positions[i * 3 + 0] = fx * scaleX + wCX;
+    positions[i * 3 + 1] = fy * scaleY + wCY;
+    positions[i * 3 + 2] = fz * scaleZ + baseZ;
 
     uvs[i * 2 + 0] = lm.x;
     uvs[i * 2 + 1] = lm.y;
@@ -337,13 +342,16 @@ function _buildFaceMesh(landmarks, imgEl) {
   mesh.name        = 'faceMesh3D';
   mesh.renderOrder = 1;
   mesh.receiveShadow = true;
-  scene.add(mesh);
+  
+  if (head) head.add(mesh);
+  else scene.add(mesh);
 
   // ── Añadir UI Biométrica Holográfica ──
   const ui = _buildLandmarkOverlay(geo);
   if (ui) {
     ui.name = 'biometricUI';
-    scene.add(ui);
+    if (head) head.add(ui);
+    else scene.add(ui);
   }
 
   return mesh;
@@ -617,9 +625,11 @@ function _removeFaceMesh() {
     _faceMesh3D = null;
   }
   
-  const ui = scene.getObjectByName('biometricUI');
+  let ui = scene.getObjectByName('biometricUI');
+  if (!ui && head) ui = head.getObjectByName('biometricUI');
+  
   if (ui) {
-    scene.remove(ui);
+    if (ui.parent) ui.parent.remove(ui);
     ui.children.forEach(c => {
       c.geometry?.dispose();
       if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
