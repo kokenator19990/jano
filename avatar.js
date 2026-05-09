@@ -197,9 +197,12 @@ export async function applyPhoto(imgEl) {
   // ── FASE 1: Gemini (no bloquea) ──────────────────────────────
   if (_GEMINI_KEY) {
     _setStatus('Analizando con Gemini AI...', false);
+    // Capturamos la referencia actual para detectar si el usuario
+    // cargó otra foto antes de que Gemini responda (race condition).
+    const meshSnapshot = faceMesh;
     analyzeWithGemini(imgEl, _GEMINI_KEY)
       .then(analysis => {
-        if (!analysis) { _setStatus(null); return; }
+        if (!analysis || _faceMesh3D !== meshSnapshot) { _setStatus(null); return; }
         _applyGeminiEnhancement(analysis);
         _setStatus('Gemini: análisis aplicado', false);
         setTimeout(() => _setStatus(null), 2000);
@@ -955,6 +958,7 @@ function _disposeGroup(group) {
     const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
     mats.forEach(m => {
       m?.map?.dispose();
+      m?.alphaMap?.dispose();
       m?.normalMap?.dispose();
       m?.roughnessMap?.dispose();
       m?.dispose();
