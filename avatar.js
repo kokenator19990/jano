@@ -1,55 +1,82 @@
 // ================================================================
-//  FaceLab Analytics — 3D Digital Clone System  v3.2
-//  Three.js r162 · GLTF heads · Projection Mapping · MediaPipe · Bloom
+//  FaceLab Analytics — 3D Digital Clone System  v4.0
+//  Three.js r162 · MediaPipe 468-pt mesh · Gemini AI Vision
 //
-//  applyPhoto() pipeline:
-//    1. Skin-tone crop   — instant, zero dependencies
-//    2. Shader injection — paints photo onto 3D surface via projective UV
-//    3. MediaPipe refine — async face-landmark crop replaces step 1 texture
+//  Pipeline de reconstrucción facial:
+//
+//  FASE 0 (instantáneo):
+//    MediaPipe FaceLandmarker → 468 landmarks 3D
+//    → Three.js BufferGeometry con triangulación canónica
+//    → Foto del paciente mapeada como textura UV
+//    → Malla facial real del paciente encima del modelo 3D
+//
+//  FASE 1 (2-5 s, async):
+//    Gemini Vision API → análisis de profundidades, proporciones,
+//    tono de piel, forma de cara
+//    → Enriquece la malla: Z-depth de nariz, mejillas, mentón
+//    → Ajusta iluminación a tono de piel real
+//    → Escala cabeza base según proporciones del paciente
+//
+//  FASE 2 (siempre visible):
+//    Overlay holográfico de landmarks médicos con bloom selectivo
 // ================================================================
 
-import * as THREE         from 'three';
-import { OrbitControls }  from 'three/addons/controls/OrbitControls.js';
-import { GLTFLoader }     from 'three/addons/loaders/GLTFLoader.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass }     from 'three/addons/postprocessing/RenderPass.js';
-import { UnrealBloomPass }from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { OutputPass }     from 'three/addons/postprocessing/OutputPass.js';
+import * as THREE          from 'three';
+import { OrbitControls }   from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader }      from 'three/addons/loaders/GLTFLoader.js';
+import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
+import { FACES }           from './geometry.js';   // 936 triangles × 3 = 2808 indices
+import { analyzeWithGemini } from './gemini.js';
 
-// ─── PRESETS ─────────────────────────────────────────────────────
+// ─── IMPORTAR CONFIG (API KEY) ────────────────────────────────
+let _GEMINI_KEY = null;
+try {
+  const cfg = await import('./config.js');
+  _GEMINI_KEY = cfg.GEMINI_API_KEY || null;
+} catch (_) {
+  // config.js no presente (deploy externo sin key)
+}
+
+// ─── PRESETS ─────────────────────────────────────────────────
 export const PRESETS = [
   { id: 0, label: 'Avatar A', sublabel: 'Femenino',  modelUrl: './models/head_female.glb' },
   { id: 1, label: 'Avatar B', sublabel: 'Masculino', modelUrl: './models/head_male.glb'   },
 ];
 
-const TARGET_H = 2.2;   // normalised head height (world units)
+const TARGET_H   = 2.2;
+const FACE_W_RATIO = 0.88;   // cara ocupa ~88 % del ancho de la cabeza
+const FACE_H_RATIO = 0.70;   // cara ocupa ~70 % del alto de la cabeza
+const FACE_Z_RATIO = 0.44;   // superficie frontal de la cabeza
 
-// ─── RENDERER STATE ──────────────────────────────────────────────
+// ─── ESTADO DEL RENDERER ─────────────────────────────────────
 let scene, camera, renderer, composer, controls, clock;
 let head          = null;
 let currentPreset = 0;
 let raf           = null;
 let loadingEl     = null;
+let statusEl      = null;
 let loadSeq       = 0;
 
-// Mouse parallax
 let tRotY = 0, tRotX = 0;
 const P_YAW   = 0.22;
 const P_PITCH = 0.10;
 const P_LERP  = 0.055;
 
-// ─── PROJECTION STATE ────────────────────────────────────────────
-//  Updated by loadPreset() and consumed by applyPhoto().
+// ─── ESTADO DEL MODELO 3D ────────────────────────────────────
 const _modelCenter = new THREE.Vector3();
 const _modelSize   = new THREE.Vector3();
-const _projPos     = new THREE.Vector3();   // projector world-space position
-let   _projMat     = null;                  // projector viewProj matrix (Matrix4)
-let   _faceMesh    = null;                  // cached largest mesh (skin)
-let   _mpLandmarker = null;                 // MediaPipe FaceLandmarker (lazy)
+
+// ─── ESTADO DE LA MALLA FACIAL ───────────────────────────────
+let _faceMesh3D    = null;   // THREE.Mesh reconstruido de MediaPipe
+let _mpLandmarker  = null;   // instancia de FaceLandmarker (lazy)
+let _hemLight      = null;   // referencia a HemisphereLight para ajuste de tono
 
 const gltfLoader = new GLTFLoader();
 
-// ─── PUBLIC API ──────────────────────────────────────────────────
+// ─── API PÚBLICA ─────────────────────────────────────────────
 
 export function init(canvas) {
   _teardown();
@@ -58,42 +85,16 @@ export function init(canvas) {
   const W = wrap.clientWidth  || 480;
   const H = wrap.clientHeight || 360;
 
-  // ── Loading overlay ─────────────────────────────────────────────
-  if (!loadingEl) {
-    if (!document.getElementById('_av_spin')) {
-      const s = document.createElement('style');
-      s.id = '_av_spin';
-      s.textContent = '@keyframes _av_spin{to{transform:rotate(360deg)}}';
-      document.head.appendChild(s);
-    }
-    loadingEl = document.createElement('div');
-    Object.assign(loadingEl.style, {
-      position: 'absolute', inset: '0', display: 'none',
-      flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-      background: 'rgba(5,16,26,0.88)', backdropFilter: 'blur(6px)',
-      color: '#00cfe0', fontFamily: "'Space Grotesk',sans-serif",
-      fontSize: '0.70rem', letterSpacing: '0.16em', gap: '14px',
-      zIndex: '10', pointerEvents: 'none',
-    });
-    loadingEl.innerHTML = `
-      <svg width="34" height="34" viewBox="0 0 34 34" fill="none"
-           style="animation:_av_spin 0.9s linear infinite">
-        <circle cx="17" cy="17" r="13" stroke="rgba(0,207,224,0.18)" stroke-width="2"/>
-        <path d="M17 4 A13 13 0 0 1 30 17" stroke="#00cfe0" stroke-width="2.2"
-              stroke-linecap="round"/>
-      </svg>
-      <span>CARGANDO MODELO</span>`;
-    wrap.style.position = 'relative';
-    wrap.appendChild(loadingEl);
-  }
+  _buildLoadingOverlay(wrap);
+  _buildStatusBar(wrap);
 
-  // ── Scene ───────────────────────────────────────────────────────
-  scene  = new THREE.Scene();
-  clock  = new THREE.Clock();
+  // Escena
+  scene = new THREE.Scene();
+  clock = new THREE.Clock();
   camera = new THREE.PerspectiveCamera(28, W / H, 0.05, 100);
   camera.position.set(0, 0, 5.6);
 
-  // ── Renderer ────────────────────────────────────────────────────
+  // Renderer
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setSize(W, H);
@@ -102,15 +103,14 @@ export function init(canvas) {
   renderer.shadowMap.enabled   = true;
   renderer.shadowMap.type      = THREE.PCFSoftShadowMap;
 
-  // ── Post-processing: RenderPass → BloomPass → OutputPass ────────
+  // Post-processing
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
-  composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, H), 1.55, 0.50, 3.50));
+  composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, H), 1.45, 0.45, 3.50));
   composer.addPass(new OutputPass());
 
   _addLights();
 
-  // ── Orbit controls ──────────────────────────────────────────────
   controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;
   controls.dampingFactor = 0.065;
@@ -140,50 +140,265 @@ export function switchPreset(idx) {
   loadPreset(idx);
 }
 
-// ─── PHOTO APPLICATION  ──────────────────────────────────────────
+// ─── PIPELINE PRINCIPAL DE FOTO ──────────────────────────────
 //
-//  Three-phase pipeline:
+//  FASE 0: MediaPipe → malla 3D inmediata
+//  FASE 1: Gemini → profundidades, tono, proporciones (async)
 //
-//  Phase 1 (sync, instant): skin-tone crop → projection shader injected
-//  Phase 2 (async ~1-5s):   MediaPipe landmark detection → precise crop
-//                            replaces Phase 1 texture if face found
-//
-export function applyPhoto(imgEl) {
+export async function applyPhoto(imgEl) {
   if (!head) return;
 
-  // Snap to frontal view so projection aligns with the face surface
+  // Snap frontal para alinear proyección
   head.rotation.set(0, 0, 0);
   tRotY = 0; tRotX = 0;
 
-  // Find (and cache) the primary skin mesh: largest vertex count in the model
-  if (!_faceMesh) {
-    let maxV = 0;
-    head.traverse(o => {
-      if (!o.isMesh) return;
-      const n = o.geometry?.attributes?.position?.count ?? 0;
-      if (n > maxV) { maxV = n; _faceMesh = o; }
-    });
+  // Eliminar malla previa si existe
+  _removeFaceMesh();
+
+  // ── FASE 0: MediaPipe ────────────────────────────────────────
+  _setStatus('Detectando rostro con MediaPipe...', true);
+
+  const fl = await _ensureMPLandmarker();
+  if (!fl) {
+    _setStatus('MediaPipe no disponible — recarga la página', false);
+    return;
   }
-  if (!_faceMesh) return;
 
-  // Set up projector camera once per preset (after model bbox is known)
-  if (!_projMat) _computeProjector();
+  let landmarks;
+  try {
+    const res = fl.detect(imgEl);
+    landmarks = res?.faceLandmarks?.[0];
+  } catch (e) {
+    console.error('[Avatar] MediaPipe detect error:', e);
+  }
 
-  // Phase 1: immediate texture from skin-tone heuristic crop
-  const canvas0 = _extractFaceFallback(imgEl);
-  const tex0 = _buildTex(canvas0);
-  _activateProjection(tex0);
+  if (!landmarks?.length) {
+    _setStatus('No se detectó rostro en la imagen', false);
+    setTimeout(() => _setStatus(null), 3500);
+    return;
+  }
 
-  // Phase 2: async MediaPipe refinement (upgrades texture silently)
-  _refineWithMediaPipe(imgEl).then(canvas1 => {
-    if (!canvas1) return;
-    const tex1 = _buildTex(canvas1);
-    const old  = _applyNewTex(tex1);   // swap in better texture
-    if (old) old.dispose();
+  _setStatus('Reconstruyendo malla facial 3D...', true);
+
+  const faceMesh = _buildFaceMesh(landmarks, imgEl);
+  head.add(faceMesh);
+  _faceMesh3D = faceMesh;
+
+  _setStatus('Malla facial 3D lista', false);
+  setTimeout(() => _setStatus(null), 1800);
+
+  // ── FASE 1: Gemini (no bloquea) ──────────────────────────────
+  if (_GEMINI_KEY) {
+    _setStatus('Analizando con Gemini AI...', false);
+    analyzeWithGemini(imgEl, _GEMINI_KEY)
+      .then(analysis => {
+        if (!analysis) { _setStatus(null); return; }
+        _applyGeminiEnhancement(analysis);
+        _setStatus('Gemini: análisis aplicado', false);
+        setTimeout(() => _setStatus(null), 2000);
+      })
+      .catch(e => {
+        console.warn('[Avatar] Gemini failed:', e);
+        _setStatus(null);
+      });
+  }
+}
+
+// ─── CONSTRUIR MALLA FACIAL 3D ───────────────────────────────
+//
+//  Convierte los 468 landmarks MediaPipe en una THREE.BufferGeometry
+//  correctamente ubicada en el espacio 3D del modelo.
+//
+//  Vértices: escalados para que la cara llene el frente del modelo.
+//  UVs:      coordenadas (x, y) del landmark en la foto — mapea
+//            directamente los píxeles correctos de la foto a cada
+//            vértice de la malla. Resultado: textura perfectamente
+//            alineada con la geometría real del rostro.
+//
+function _buildFaceMesh(landmarks, imgEl) {
+  const N = 468;
+
+  // ── Bounding box de los landmarks en espacio normalizado ─────
+  let lx0 = 1, ly0 = 1, lx1 = 0, ly1 = 0;
+  for (let i = 0; i < N; i++) {
+    const lm = landmarks[i];
+    if (lm.x < lx0) lx0 = lm.x;
+    if (lm.y < ly0) ly0 = lm.y;
+    if (lm.x > lx1) lx1 = lm.x;
+    if (lm.y > ly1) ly1 = lm.y;
+  }
+
+  const faceCxN = (lx0 + lx1) / 2;
+  const faceCyN = (ly0 + ly1) / 2;
+  const faceWN  = Math.max(lx1 - lx0, 0.01);
+  const faceHN  = Math.max(ly1 - ly0, 0.01);
+
+  // ── Escala para que la malla llene el frente del modelo ──────
+  const scaleX = (_modelSize.x * FACE_W_RATIO) / faceWN;
+  const scaleY = (_modelSize.y * FACE_H_RATIO) / faceHN;
+  // Z: MediaPipe da profundidad relativa; la escalamos para que
+  //    la variación de profundidad sea visible pero no exagerada
+  const scaleZ = _modelSize.z * 0.32;
+
+  // Centro de la cara en world space (ligeramente por encima del
+  // centro del modelo, que incluye cuello)
+  const wCX = _modelCenter.x;
+  const wCY = _modelCenter.y + _modelSize.y * 0.06;
+  const wCZ = _modelCenter.z + _modelSize.z * FACE_Z_RATIO;
+
+  // ── Arrays de geometría ──────────────────────────────────────
+  const positions = new Float32Array(N * 3);
+  const uvs       = new Float32Array(N * 2);
+
+  for (let i = 0; i < N; i++) {
+    const lm = landmarks[i];
+
+    // Posición 3D en world space
+    positions[i * 3 + 0] = (lm.x - faceCxN) * scaleX + wCX;
+    positions[i * 3 + 1] = -(lm.y - faceCyN) * scaleY + wCY;
+    positions[i * 3 + 2] = lm.z * scaleZ + wCZ;
+
+    // UV: coordenadas del landmark en la imagen original
+    // Mapeo directo → cada vértice muestrea su píxel exacto en la foto
+    uvs[i * 2 + 0] = lm.x;
+    uvs[i * 2 + 1] = 1.0 - lm.y; // Y invertido (Three.js UV origin = bottom-left)
+  }
+
+  // ── Geometría ────────────────────────────────────────────────
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('uv',       new THREE.BufferAttribute(uvs, 2));
+  geo.setIndex(new THREE.BufferAttribute(new Uint16Array(FACES), 1));
+  geo.computeVertexNormals();
+
+  // ── Textura de la foto ───────────────────────────────────────
+  const photoCanvas = document.createElement('canvas');
+  photoCanvas.width  = imgEl.naturalWidth  || 640;
+  photoCanvas.height = imgEl.naturalHeight || 480;
+  photoCanvas.getContext('2d').drawImage(imgEl, 0, 0);
+
+  const photoTex = new THREE.CanvasTexture(photoCanvas);
+  photoTex.colorSpace  = THREE.SRGBColorSpace;
+  photoTex.flipY       = false; // Ya invertimos Y en los UVs
+  photoTex.minFilter   = THREE.LinearFilter;
+  photoTex.magFilter   = THREE.LinearFilter;
+  photoTex.needsUpdate = true;
+
+  // ── Material PBR con textura de foto ─────────────────────────
+  const mat = new THREE.MeshStandardMaterial({
+    map:         photoTex,
+    side:        THREE.FrontSide,
+    roughness:   0.72,
+    metalness:   0.0,
+    envMapIntensity: 0.4,
+  });
+
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.name = 'faceMesh3D';
+
+  // Offset mínimo para evitar z-fighting con el modelo base
+  mesh.renderOrder = 1;
+
+  return mesh;
+}
+
+// ─── MEJORAS DE GEMINI ────────────────────────────────────────
+//
+//  Aplica el análisis de profundidades de Gemini sobre la malla
+//  facial ya construida: desplaza vértices en Z para dar mayor
+//  realismo a nariz, mejillas, mentón y arcos superciliares.
+//
+function _applyGeminiEnhancement(analysis) {
+  if (!_faceMesh3D) return;
+
+  const pos = _faceMesh3D.geometry.getAttribute('position');
+  const N   = Math.min(468, pos.count);
+  const dep  = analysis.depthFeatures || {};
+  const prop = analysis.proportions   || {};
+  const skin = analysis.skinAnalysis  || {};
+
+  // ── 1. Profundidades por zona ────────────────────────────────
+  //
+  // MediaPipe landmark indices (aproximados, basados en el mapa canónico):
+  //   Punta de nariz:    4, 1
+  //   Dorso nariz:       6, 19, 94
+  //   Alas nasales:      218, 438, 79, 309
+  //   Arcos superciliares: 105, 107, 55, 8, 285, 336, 334
+  //   Mejillas:          205, 425, 50, 280
+  //   Labios:            13, 14, 317, 87, 146, 375
+  //   Mentón:            152, 175, 199, 200
+  //   Sienes:            127, 356, 454, 234
+
+  const NOSE_BOOST   = (dep.noseProminence      ?? 0.5) * 0.09;
+  const BROW_BOOST   = (dep.browRidge           ?? 0.3) * 0.035;
+  const CHEEK_INDENT = (dep.cheekboneProminence ?? 0.5) * 0.025;
+  const CHIN_BOOST   = (dep.chinProjection      ?? 0.4) * 0.030;
+  const LIP_BOOST    = (dep.lipFullness         ?? 0.4) * 0.018;
+  const EYE_DEPTH    = (dep.eyeSocketDepth      ?? 0.4) * 0.022;
+
+  const bumps = [
+    // [indices, deltaZ]
+    [[4, 1, 19, 94],                           +NOSE_BOOST        ],
+    [[218, 438, 79, 309, 49, 279],             +NOSE_BOOST * 0.55 ],
+    [[105, 107, 55, 8, 285, 336, 334],         +BROW_BOOST        ],
+    [[205, 425, 50, 280],                      +CHEEK_INDENT      ],
+    [[152, 175, 199, 200, 32, 262],            +CHIN_BOOST        ],
+    [[13, 14, 317, 87, 146, 375, 185, 409],   +LIP_BOOST         ],
+    [[33, 7, 163, 246, 263, 362, 382, 466],   -EYE_DEPTH         ], // ojos se hunden
+    [[127, 356, 454, 234, 162, 389],           -0.012             ], // sienes retroceden
+  ];
+
+  bumps.forEach(([indices, dz]) => {
+    indices.forEach(idx => {
+      if (idx < N) pos.setZ(idx, pos.getZ(idx) + dz);
+    });
+  });
+
+  pos.needsUpdate = true;
+  _faceMesh3D.geometry.computeVertexNormals();
+
+  // ── 2. Ajuste de roughness por brillo de piel ────────────────
+  const shininess = skin.shininess ?? 0.25;
+  if (_faceMesh3D.material) {
+    _faceMesh3D.material.roughness = THREE.MathUtils.clamp(0.55 + (1 - shininess) * 0.35, 0.55, 0.90);
+    _faceMesh3D.material.needsUpdate = true;
+  }
+
+  // ── 3. Ajuste de iluminación ambiental al tono de piel ───────
+  if (skin.primaryColor && _hemLight) {
+    const skinColor  = new THREE.Color(skin.primaryColor);
+    const warmth     = skin.warmth ?? 0.5;
+    // Mezcla sutil: 18 % hacia el tono real del paciente
+    _hemLight.color.lerp(skinColor, 0.18);
+    // Si piel cálida → ajustar temperatura del key light
+    const keyLight = scene.children.find(o => o.isDirectionalLight && o.position.z > 3);
+    if (keyLight) {
+      const warm = new THREE.Color(1.0, 0.97 + warmth * 0.04, 0.93 - warmth * 0.04);
+      keyLight.color.lerp(warm, 0.12);
+    }
+  }
+
+  // ── 4. Escala del modelo base (proporciones de Gemini) ───────
+  if (prop.faceAspect && head) {
+    // faceAspect = alto/ancho de cara. Más alto que 1.3 → cara más larga.
+    const aspect     = THREE.MathUtils.clamp(prop.faceAspect, 0.85, 1.85);
+    const targetY    = THREE.MathUtils.clamp(1.0 + (aspect - 1.3) * 0.10, 0.90, 1.10);
+    head.scale.y     = THREE.MathUtils.lerp(head.scale.y, targetY, 0.55);
+  }
+  if (prop.jawWidth && head) {
+    // jawWidth es fracción del ancho de la cara [0,1]. Referencia = 0.52.
+    const jawRatio = THREE.MathUtils.clamp(prop.jawWidth / 0.52, 0.85, 1.18);
+    head.scale.x   = THREE.MathUtils.lerp(head.scale.x, jawRatio, 0.40);
+  }
+
+  console.info('[Avatar] Gemini enhancement applied:', {
+    noseBoost: NOSE_BOOST.toFixed(3),
+    skinColor: skin.primaryColor,
+    faceAspect: prop.faceAspect,
   });
 }
 
-// ─── INTERNAL: LOAD PRESET ───────────────────────────────────────
+// ─── CARGA DE PRESET ─────────────────────────────────────────
 
 function loadPreset(idx) {
   const seq    = ++loadSeq;
@@ -191,10 +406,7 @@ function loadPreset(idx) {
 
   _showLoading(true);
   if (head) { scene.remove(head); _disposeGroup(head); head = null; }
-
-  // Reset projection state on model change
-  _faceMesh = null;
-  _projMat  = null;
+  _faceMesh3D = null;
 
   gltfLoader.load(
     preset.modelUrl,
@@ -204,7 +416,7 @@ function loadPreset(idx) {
 
       const model = gltf.scene;
 
-      // ── Normalise to TARGET_H, centre at world origin ────────────
+      // Normalizar a TARGET_H, centrar en origen
       const b0 = new THREE.Box3().setFromObject(model);
       const s0 = b0.getSize(new THREE.Vector3());
       const c0 = b0.getCenter(new THREE.Vector3());
@@ -213,25 +425,21 @@ function loadPreset(idx) {
       model.scale.setScalar(k);
       model.position.set(-c0.x * k, -c0.y * k, -c0.z * k);
       model.updateWorldMatrix(true, true);
-
       model.traverse(o => { if (o.isMesh) o.castShadow = o.receiveShadow = true; });
 
-      // ── Normalised bbox ──────────────────────────────────────────
+      // BBox normalizada
       const b1 = new THREE.Box3().setFromObject(model);
       const c1 = b1.getCenter(new THREE.Vector3());
       const s1 = b1.getSize(new THREE.Vector3());
-
-      // Store for applyPhoto()
       _modelCenter.copy(c1);
       _modelSize.copy(s1);
 
-      // ── Group ────────────────────────────────────────────────────
       head = new THREE.Group();
       head.add(model);
-      head.add(_buildLandmarks(c1, s1.x * 0.5, s1.y * 0.5, s1.z * 0.5));
+      head.add(_buildLandmarkOverlay(c1, s1.x * 0.5, s1.y * 0.5, s1.z * 0.5));
       scene.add(head);
 
-      // ── Auto-frame camera ────────────────────────────────────────
+      // Auto-frame cámara
       const fovR = camera.fov * (Math.PI / 180);
       const dist = (s1.y * 0.52) / Math.tan(fovR / 2);
       const tY   = c1.y + s1.y * 0.04;
@@ -248,212 +456,10 @@ function loadPreset(idx) {
   );
 }
 
-// ─── PROJECTION MAPPING ──────────────────────────────────────────
-//
-//  Sets up a virtual "projector" camera in front of the face and
-//  injects a GLSL chunk into the model's existing MeshStandardMaterial
-//  (via onBeforeCompile) that:
-//    1. Computes each vertex's position in the projector's clip space
-//    2. Back-face culls using the world-space normal dot projector dir
-//    3. Blends the photo texture onto diffuseColor before PBR lighting
-//
-//  Because the blend happens BEFORE lighting, the projected face is
-//  naturally shaded by the scene lights, giving a realistic appearance.
-//
+// ─── MEDIAPIPE (LAZY) ─────────────────────────────────────────
 
-function _computeProjector() {
-  // Projector at a canonical frontal position in front of the face.
-  // Face forward (after normalization) is +Z. Face surface is at
-  // approximately c.z + halfDepth * 0.55.
-  const fZ = _modelCenter.z + _modelSize.z * 0.50;  // ≈ face surface z
-  const pZ = fZ + 3.8;                               // 3.8 units in front
-
-  _projPos.set(_modelCenter.x, _modelCenter.y + _modelSize.y * 0.02, pZ);
-
-  const projCam = new THREE.PerspectiveCamera(27, 1, 0.1, 20);
-  projCam.position.copy(_projPos);
-  projCam.lookAt(_modelCenter.x, _modelCenter.y, fZ);
-  projCam.updateMatrixWorld();
-
-  // viewProj = projectionMatrix × viewMatrix (world → clip space)
-  _projMat = new THREE.Matrix4()
-    .multiplyMatrices(projCam.projectionMatrix, projCam.matrixWorldInverse);
-}
-
-// Vertex shader injection — adds projection varyings
-const _VERT_PARS = `
-  uniform mat4  uProjMatrix_fp;
-  varying vec4  vProjCoord_fp;
-  varying vec3  vWorldNorm_fp;
-  varying vec3  vWorldPos_fp;
-`;
-
-const _VERT_MAIN = `
-  // World-space position and normal for projection (uses 'transformed'
-  // and 'objectNormal' which are already morph/skin processed at this point)
-  vec4 _wpFP    = modelMatrix * vec4(transformed, 1.0);
-  vWorldPos_fp  = _wpFP.xyz;
-  vWorldNorm_fp = normalize(mat3(modelMatrix) * objectNormal);
-  vProjCoord_fp = uProjMatrix_fp * _wpFP;
-`;
-
-// Fragment shader injection — blends photo into diffuseColor before lighting
-const _FRAG_PARS = `
-  uniform sampler2D uPhotoTex_fp;
-  uniform float     uProjOn_fp;      // 0 = off (no photo), 1 = on
-  uniform vec3      uProjPos_fp;     // projector world position
-  varying vec4      vProjCoord_fp;
-  varying vec3      vWorldNorm_fp;
-  varying vec3      vWorldPos_fp;
-`;
-
-const _FRAG_INJECT = `
-  // ── Photo projection blend (before PBR lighting) ──────────────
-  if (uProjOn_fp > 0.5) {
-    vec3  pndc  = vProjCoord_fp.xyz / vProjCoord_fp.w;
-    vec2  puv   = pndc.xy * 0.5 + 0.5;
-
-    bool  inF   = vProjCoord_fp.w > 0.0
-                  && all(greaterThan(puv, vec2(0.0)))
-                  && all(lessThan (puv, vec2(1.0)));
-
-    // World-space facing: how directly does the surface face the projector?
-    vec3  pdir  = normalize(uProjPos_fp - vWorldPos_fp);
-    float face  = max(0.0, dot(normalize(vWorldNorm_fp), pdir));
-
-    // Feather UV edges so photo doesn't have a hard border on the skin
-    vec2  ef    = smoothstep(0.0,  0.15, puv) * smoothstep(1.0, 0.85, puv);
-
-    float blend = inF
-      ? smoothstep(0.12, 0.72, face) * ef.x * ef.y
-      : 0.0;
-
-    vec4  photo = texture2D(uPhotoTex_fp, puv);
-    // Blend into diffuseColor so the photo is lit by scene lights
-    diffuseColor.rgb = mix(diffuseColor.rgb, photo.rgb, blend * 0.90);
-  }
-  // ─────────────────────────────────────────────────────────────
-`;
-
-function _activateProjection(tex) {
-  const mats = Array.isArray(_faceMesh.material)
-    ? _faceMesh.material : [_faceMesh.material];
-
-  mats.forEach(m => {
-    if (m.userData._projShader) {
-      // Shader already compiled: update uniforms in place (no recompile needed)
-      m.userData._projShader.uniforms.uPhotoTex_fp.value = tex;
-      m.userData._projShader.uniforms.uProjOn_fp.value   = 1.0;
-      return;
-    }
-
-    // First call: inject shader and force recompile
-    const projMat   = _projMat.clone();
-    const projPos   = _projPos.clone();
-    let   shaderRef = null;
-
-    m.onBeforeCompile = shader => {
-      shaderRef = shader;
-      m.userData._projShader = shader;
-
-      shader.uniforms.uProjMatrix_fp = { value: projMat  };
-      shader.uniforms.uPhotoTex_fp   = { value: tex      };
-      shader.uniforms.uProjPos_fp    = { value: projPos  };
-      shader.uniforms.uProjOn_fp     = { value: 1.0      };
-
-      // ── Vertex shader ──────────────────────────────────────────
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <uv_pars_vertex>',
-          `#include <uv_pars_vertex>\n${_VERT_PARS}`)
-        .replace('#include <project_vertex>',
-          `#include <project_vertex>\n${_VERT_MAIN}`);
-
-      // ── Fragment shader ────────────────────────────────────────
-      shader.fragmentShader =
-        `${_FRAG_PARS}\n${shader.fragmentShader}`
-          .replace('#include <map_fragment>',
-            `#include <map_fragment>\n${_FRAG_INJECT}`);
-    };
-
-    // customProgramCacheKey ensures recompile if called again
-    m.customProgramCacheKey = () => 'proj_v1';
-    m.needsUpdate = true;
-  });
-}
-
-function _applyNewTex(newTex) {
-  const mats = Array.isArray(_faceMesh.material)
-    ? _faceMesh.material : [_faceMesh.material];
-  let old = null;
-  mats.forEach(m => {
-    const sh = m.userData._projShader;
-    if (!sh) return;
-    old = sh.uniforms.uPhotoTex_fp.value;
-    sh.uniforms.uPhotoTex_fp.value = newTex;
-  });
-  return old;
-}
-
-function _buildTex(canvas) {
-  const t = new THREE.CanvasTexture(canvas);
-  t.colorSpace = THREE.SRGBColorSpace;
-  return t;
-}
-
-// ─── FACE EXTRACTION — SKIN-TONE HEURISTIC (no deps) ─────────────
-//
-//  Analyzes pixel data to locate skin-tone pixels, computes their
-//  centroid, then crops a square region around that centroid.
-//  Falls back to portrait-photo heuristic (upper-center) if detection
-//  fails (< 4 % of pixels match skin model).
-//
-function _extractFaceFallback(imgEl) {
-  const W = imgEl.naturalWidth  || imgEl.width  || 640;
-  const H = imgEl.naturalHeight || imgEl.height || 480;
-
-  // Downsample for fast pixel analysis (≤ 360 px wide)
-  const scale = Math.min(1, 360 / W);
-  const sw    = Math.round(W * scale);
-  const sh    = Math.round(H * scale);
-
-  const tmp = document.createElement('canvas');
-  tmp.width = sw; tmp.height = sh;
-  tmp.getContext('2d').drawImage(imgEl, 0, 0, sw, sh);
-  const data = tmp.getContext('2d').getImageData(0, 0, sw, sh).data;
-
-  let sx = 0, sy = 0, sc = 0;
-  for (let y = 0; y < sh; y++) {
-    for (let x = 0; x < sw; x++) {
-      const i = (y * sw + x) * 4;
-      const r = data[i], g = data[i + 1], b = data[i + 2];
-      // Simplified Kovač-Čajić RGB skin model
-      if (r > 95 && g > 40 && b > 20 && r > g && r > b && (r - g) > 15) {
-        sx += x; sy += y; sc++;
-      }
-    }
-  }
-
-  let cx, cy, sz;
-  if (sc > sw * sh * 0.04) {        // 4 % threshold → skin found
-    cx = (sx / sc) / scale;
-    cy = (sy / sc) / scale;
-    sz = Math.min(W, H) * 0.58;
-  } else {                           // portrait fallback
-    cx = W * 0.50;
-    cy = H * 0.32;
-    sz = Math.min(W, H) * 0.62;
-  }
-
-  return _cropToCanvas(imgEl, cx, cy, sz, W, H);
-}
-
-// ─── FACE EXTRACTION — MEDIAPIPE (async, lazy-loaded) ────────────
-//
-//  Loads MediaPipe FaceLandmarker on first use (~4 MB WASM + model).
-//  Returns a precisely-cropped face canvas or null on failure.
-//
 async function _ensureMPLandmarker() {
-  if (_mpLandmarker !== null) return _mpLandmarker;
+  if (_mpLandmarker !== null) return _mpLandmarker || null;
 
   try {
     const mod = await import(
@@ -481,106 +487,61 @@ async function _ensureMPLandmarker() {
     console.info('[Avatar] MediaPipe FaceLandmarker ready');
   } catch (err) {
     console.warn('[Avatar] MediaPipe unavailable:', err.message);
-    _mpLandmarker = false;   // sentinel: tried but failed — don't retry
+    _mpLandmarker = false;
   }
 
   return _mpLandmarker || null;
 }
 
-async function _refineWithMediaPipe(imgEl) {
-  const fl = await _ensureMPLandmarker();
-  if (!fl) return null;
+// ─── HELPERS ─────────────────────────────────────────────────
 
-  try {
-    const result = fl.detect(imgEl);
-    const lm = result?.faceLandmarks?.[0];
-    if (!lm?.length) return null;
-
-    const W = imgEl.naturalWidth  || imgEl.width  || 640;
-    const H = imgEl.naturalHeight || imgEl.height || 480;
-
-    // Bounding box from the 478 detected landmarks
-    let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
-    lm.forEach(p => {
-      if (p.x < x0) x0 = p.x;
-      if (p.y < y0) y0 = p.y;
-      if (p.x > x1) x1 = p.x;
-      if (p.y > y1) y1 = p.y;
-    });
-
-    // Square crop: expand bbox 28% for context (hair, chin, ears)
-    // Convert normalized [0,1] landmark coords to pixel space before computing size
-    const cx      = (x0 + x1) / 2;
-    const cy      = (y0 + y1) / 2;
-    const halfPxX = (x1 - x0) / 2 * 1.28 * W;
-    const halfPxY = (y1 - y0) / 2 * 1.28 * H;
-    const sz      = Math.max(halfPxX, halfPxY) * 2;
-
-    return _cropToCanvas(imgEl, cx * W, cy * H, sz, W, H);
-  } catch (e) {
-    console.warn('[Avatar] MediaPipe detect error:', e.message);
-    return null;
+function _removeFaceMesh() {
+  if (!_faceMesh3D) return;
+  if (head) head.remove(_faceMesh3D);
+  _faceMesh3D.geometry?.dispose();
+  const mat = _faceMesh3D.material;
+  if (mat) {
+    mat.map?.dispose();
+    mat.dispose();
   }
+  _faceMesh3D = null;
 }
 
-// ─── SHARED CROP UTILITY ─────────────────────────────────────────
+// ─── ILUMINACIÓN ─────────────────────────────────────────────
 
-function _cropToCanvas(imgEl, cx, cy, sz, W, H) {
-  const out = document.createElement('canvas');
-  out.width = out.height = 512;
-  const ctx = out.getContext('2d');
-
-  // Neutral skin fallback (shown at edges if crop overshoots image bounds)
-  ctx.fillStyle = '#C29070';
-  ctx.fillRect(0, 0, 512, 512);
-
-  const sx = Math.max(0, cx - sz / 2);
-  const sy = Math.max(0, cy - sz / 2);
-  const sw = Math.min(sz, W - sx);
-  const sh = Math.min(sz, H - sy);
-
-  if (sw > 0 && sh > 0) {
-    ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, 512, 512);
-  }
-
-  return out;
-}
-
-// ─── MOUSE PARALLAX ──────────────────────────────────────────────
-function _onMouse(e) {
-  tRotY =  ((e.clientX / window.innerWidth)  * 2 - 1) * P_YAW;
-  tRotX = -((e.clientY / window.innerHeight) * 2 - 1) * P_PITCH * 0.55;
-}
-
-// ─── LIGHTING ────────────────────────────────────────────────────
 function _addLights() {
-  scene.add(new THREE.HemisphereLight(0x4A6880, 0x2A1810, 1.6));
+  _hemLight = new THREE.HemisphereLight(0x4A6880, 0x2A1810, 1.6);
+  scene.add(_hemLight);
 
+  // Key light (frontal cálido)
   const key = new THREE.DirectionalLight(0xFFF5EC, 4.2);
   key.position.set(-2, 3, 5);
   key.castShadow = true;
   key.shadow.mapSize.set(1024, 1024);
   scene.add(key);
 
+  // Fill (lateral frío)
   const fill = new THREE.DirectionalLight(0xCCDDFF, 1.4);
   fill.position.set(4, 0.5, 2);
   scene.add(fill);
 
+  // Rim (contraluz)
   const rim = new THREE.DirectionalLight(0x88AAFF, 3.0);
   rim.position.set(0, 2, -8);
   scene.add(rim);
 
+  // Under (relleno inferior)
   const under = new THREE.DirectionalLight(0xFFE8CC, 0.40);
   under.position.set(0, -5, 2);
   scene.add(under);
 }
 
-// ─── HOLOGRAPHIC LANDMARK OVERLAY ────────────────────────────────
+// ─── OVERLAY HOLOGRÁFICO DE LANDMARKS ────────────────────────
 //
-//  35 anatomical points as fractional offsets of the model's bbox.
-//  HDR cyan colors: lum > 3.5 → selective bloom; skin lum ≈ 2.9 → no bloom.
+//  35 puntos anatómicos + 44 aristas de estructura craneofacial.
+//  Colores HDR (luminancia > 3.5) → bloom selectivo cyan.
 //
-function _buildLandmarks(center, hw, hh, hd) {
+function _buildLandmarkOverlay(center, hw, hh, hd) {
   const { x: cx, y: cy, z: cz } = center;
   const ZOFF = 0.06;
 
@@ -631,6 +592,7 @@ function _buildLandmarks(center, hw, hh, hd) {
     [18,23],[19,24],[23,22],[24,22],
     [28,22],[32,22],[ 0,13],[20,15],
   ];
+
   const lGeo = new THREE.BufferGeometry();
   lGeo.setAttribute('position', new THREE.BufferAttribute(buf.slice(), 3));
   lGeo.setIndex(new THREE.BufferAttribute(
@@ -647,7 +609,8 @@ function _buildLandmarks(center, hw, hh, hd) {
   return g;
 }
 
-// ─── RENDER LOOP ─────────────────────────────────────────────────
+// ─── RENDER LOOP ─────────────────────────────────────────────
+
 function renderLoop() {
   raf = requestAnimationFrame(renderLoop);
   const t = clock.getElapsedTime();
@@ -662,25 +625,97 @@ function renderLoop() {
   composer.render();
 }
 
-// ─── UTILITIES ───────────────────────────────────────────────────
+// ─── UI HELPERS ──────────────────────────────────────────────
+
+function _buildLoadingOverlay(wrap) {
+  if (loadingEl) return;
+  if (!document.getElementById('_av_spin')) {
+    const s = document.createElement('style');
+    s.id = '_av_spin';
+    s.textContent = '@keyframes _av_spin{to{transform:rotate(360deg)}}';
+    document.head.appendChild(s);
+  }
+  loadingEl = document.createElement('div');
+  Object.assign(loadingEl.style, {
+    position: 'absolute', inset: '0', display: 'none',
+    flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+    background: 'rgba(5,16,26,0.88)', backdropFilter: 'blur(6px)',
+    color: '#00cfe0', fontFamily: "'Space Grotesk',sans-serif",
+    fontSize: '0.70rem', letterSpacing: '0.16em', gap: '14px',
+    zIndex: '10', pointerEvents: 'none',
+  });
+  loadingEl.innerHTML = `
+    <svg width="34" height="34" viewBox="0 0 34 34" fill="none"
+         style="animation:_av_spin 0.9s linear infinite">
+      <circle cx="17" cy="17" r="13" stroke="rgba(0,207,224,0.18)" stroke-width="2"/>
+      <path d="M17 4 A13 13 0 0 1 30 17" stroke="#00cfe0" stroke-width="2.2"
+            stroke-linecap="round"/>
+    </svg>
+    <span>CARGANDO MODELO</span>`;
+  wrap.style.position = 'relative';
+  wrap.appendChild(loadingEl);
+}
+
+function _buildStatusBar(wrap) {
+  if (statusEl) return;
+  statusEl = document.createElement('div');
+  Object.assign(statusEl.style, {
+    position: 'absolute', bottom: '8px', left: '50%',
+    transform: 'translateX(-50%)',
+    background: 'rgba(0,10,20,0.82)', backdropFilter: 'blur(8px)',
+    border: '1px solid rgba(0,207,224,0.25)',
+    color: '#00cfe0', fontFamily: "'Space Grotesk',sans-serif",
+    fontSize: '0.65rem', letterSpacing: '0.14em',
+    padding: '5px 14px', borderRadius: '20px',
+    display: 'none', alignItems: 'center', gap: '8px',
+    zIndex: '20', pointerEvents: 'none',
+    whiteSpace: 'nowrap',
+    maxWidth: '90%',
+  });
+  wrap.appendChild(statusEl);
+}
+
+function _setStatus(msg, showSpinner = false) {
+  if (!statusEl) return;
+  if (!msg) {
+    statusEl.style.display = 'none';
+    return;
+  }
+  const spinHtml = showSpinner
+    ? `<svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+          style="animation:_av_spin 0.9s linear infinite;flex-shrink:0">
+         <path d="M6 1 A5 5 0 0 1 11 6" stroke="#00cfe0" stroke-width="1.8"
+               stroke-linecap="round"/>
+       </svg>`
+    : `<span style="width:6px;height:6px;border-radius:50%;
+          background:#00cfe0;box-shadow:0 0 6px #00cfe0;flex-shrink:0"></span>`;
+  statusEl.innerHTML = `${spinHtml}<span>${msg}</span>`;
+  statusEl.style.display = 'flex';
+}
 
 function _showLoading(v) {
   if (loadingEl) loadingEl.style.display = v ? 'flex' : 'none';
 }
 
+function _onMouse(e) {
+  tRotY =  ((e.clientX / window.innerWidth)  * 2 - 1) * P_YAW;
+  tRotX = -((e.clientY / window.innerHeight) * 2 - 1) * P_PITCH * 0.55;
+}
+
+// ─── TEARDOWN ────────────────────────────────────────────────
+
 function _teardown() {
   if (raf !== null)  { cancelAnimationFrame(raf); raf = null; }
   if (head)          { _disposeGroup(head); head = null; }
-  if (composer)      {
+  _faceMesh3D = null;
+  if (composer) {
     composer.renderTarget1?.dispose();
     composer.renderTarget2?.dispose();
     composer = null;
   }
-  if (controls)      { controls.dispose(); controls = null; }
-  if (renderer)      { renderer.dispose(); renderer = null; }
+  if (controls) { controls.dispose(); controls = null; }
+  if (renderer) { renderer.dispose(); renderer = null; }
   document.removeEventListener('mousemove', _onMouse);
-  _faceMesh = null;
-  _projMat  = null;
 }
 
 function _disposeGroup(group) {
@@ -692,8 +727,6 @@ function _disposeGroup(group) {
       m?.map?.dispose();
       m?.normalMap?.dispose();
       m?.roughnessMap?.dispose();
-      // Dispose projected photo texture if present
-      m?.userData?._projShader?.uniforms?.uPhotoTex_fp?.value?.dispose();
       m?.dispose();
     });
   });
