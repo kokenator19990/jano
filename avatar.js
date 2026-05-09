@@ -1,5 +1,5 @@
 // ================================================================
-//  FaceLab Analytics — 3D Digital Clone System  v3.1
+//  FaceLab Analytics — 3D Digital Clone System  v3.2
 //  Three.js r162 · GLTF heads · Projection Mapping · MediaPipe · Bloom
 //
 //  applyPhoto() pipeline:
@@ -150,6 +150,10 @@ export function switchPreset(idx) {
 //
 export function applyPhoto(imgEl) {
   if (!head) return;
+
+  // Snap to frontal view so projection aligns with the face surface
+  head.rotation.set(0, 0, 0);
+  tRotY = 0; tRotX = 0;
 
   // Find (and cache) the primary skin mesh: largest vertex count in the model
   if (!_faceMesh) {
@@ -318,15 +322,15 @@ const _FRAG_INJECT = `
     float face  = max(0.0, dot(normalize(vWorldNorm_fp), pdir));
 
     // Feather UV edges so photo doesn't have a hard border on the skin
-    vec2  ef    = smoothstep(0.0,  0.10, puv) * smoothstep(1.0, 0.90, puv);
+    vec2  ef    = smoothstep(0.0,  0.15, puv) * smoothstep(1.0, 0.85, puv);
 
     float blend = inF
-      ? smoothstep(0.20, 0.65, face) * ef.x * ef.y
+      ? smoothstep(0.12, 0.72, face) * ef.x * ef.y
       : 0.0;
 
     vec4  photo = texture2D(uPhotoTex_fp, puv);
     // Blend into diffuseColor so the photo is lit by scene lights
-    diffuseColor.rgb = mix(diffuseColor.rgb, photo.rgb, blend * 0.96);
+    diffuseColor.rgb = mix(diffuseColor.rgb, photo.rgb, blend * 0.90);
   }
   // ─────────────────────────────────────────────────────────────
 `;
@@ -504,12 +508,15 @@ async function _refineWithMediaPipe(imgEl) {
       if (p.y > y1) y1 = p.y;
     });
 
-    // Square crop: expand bbox 24 % for context (hair, chin, ears)
-    const cx   = (x0 + x1) / 2;
-    const cy   = (y0 + y1) / 2;
-    const half = Math.max((x1 - x0) / 2, (y1 - y0) / 2) * 1.24;
+    // Square crop: expand bbox 28% for context (hair, chin, ears)
+    // Convert normalized [0,1] landmark coords to pixel space before computing size
+    const cx      = (x0 + x1) / 2;
+    const cy      = (y0 + y1) / 2;
+    const halfPxX = (x1 - x0) / 2 * 1.28 * W;
+    const halfPxY = (y1 - y0) / 2 * 1.28 * H;
+    const sz      = Math.max(halfPxX, halfPxY) * 2;
 
-    return _cropToCanvas(imgEl, cx * W, cy * H, half * 2 * Math.max(W, H) * 0.5, W, H);
+    return _cropToCanvas(imgEl, cx * W, cy * H, sz, W, H);
   } catch (e) {
     console.warn('[Avatar] MediaPipe detect error:', e.message);
     return null;
@@ -535,13 +542,6 @@ function _cropToCanvas(imgEl, cx, cy, sz, W, H) {
   if (sw > 0 && sh > 0) {
     ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, 512, 512);
   }
-
-  // Soft circular vignette — fades harsh rectangular edge
-  const grad = ctx.createRadialGradient(256, 256, 180, 256, 256, 260);
-  grad.addColorStop(0, 'rgba(0,0,0,0)');
-  grad.addColorStop(1, 'rgba(0,0,0,0.55)');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, 512, 512);
 
   return out;
 }
