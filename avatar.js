@@ -24,9 +24,12 @@
 import * as THREE          from 'three';
 import { OrbitControls }   from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader }      from 'three/addons/loaders/GLTFLoader.js';
+import { KTX2Loader }      from 'three/addons/loaders/KTX2Loader.js';
+import { MeshoptDecoder }  from 'three/addons/libs/meshopt_decoder.module.js';
 import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { BokehPass }       from 'three/addons/postprocessing/BokehPass.js';
 import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
 import { FACES }           from './geometry.js';   // 936 triangles × 3 = 2808 indices
 import { analyzeWithGemini } from './gemini.js';
@@ -110,10 +113,30 @@ export function init(canvas) {
   renderer.shadowMap.enabled   = true;
   renderer.shadowMap.type      = THREE.PCFSoftShadowMap;
 
+  // Loaders para texturas y mallas comprimidas
+  const ktx2Loader = new KTX2Loader()
+    .setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/libs/basis/')
+    .detectSupport(renderer);
+  gltfLoader.setKTX2Loader(ktx2Loader);
+  gltfLoader.setMeshoptDecoder(MeshoptDecoder);
+
   // Post-processing
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
-  composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, H), 1.45, 0.45, 3.50));
+  
+  // Bloom for glowing biometric nodes
+  const bloomPass = new UnrealBloomPass(new THREE.Vector2(W, H), 1.8, 0.45, 1.5);
+  composer.addPass(bloomPass);
+
+  // Depth of Field (BokehPass) for cinematic photography look
+  const bokehPass = new BokehPass(scene, camera, {
+    focus: 5.6,
+    aperture: 0.008,
+    maxblur: 0.01,
+    width: W, height: H
+  });
+  composer.addPass(bokehPass);
+
   composer.addPass(new OutputPass());
 
   _addLights();
@@ -222,13 +245,6 @@ export async function applyPhoto(imgEl) {
 //     para que la cara ocupe FACE_W/H_RATIO del frente del modelo.
 //
 //  2. POSICIÓN Z — raycasting: para cada vértice se dispara un rayo
-//     desde delante del modelo en dirección -Z. El punto de impacto
-//     en la superficie del modelo 3D determina la Z exacta del
-//     vértice → la malla se adhiere a la curvatura real del modelo.
-//     Se añade la profundidad relativa de MediaPipe encima (negada:
-//     en MediaPipe z negativo = más cerca de la cámara, que en
-//     Three.js es +Z, así que invertimos el signo).
-//
 function _buildFaceMesh(landmarks, imgEl) {
   const N = 468;
 
@@ -246,51 +262,27 @@ function _buildFaceMesh(landmarks, imgEl) {
   // ── Escala XY ─────────────────────────────────────────────
   const scaleX = (_modelSize.x * FACE_W_RATIO) / faceWN;
   const scaleY = (_modelSize.y * FACE_H_RATIO) / faceHN;
+  const uniformScale = (scaleX + scaleY) / 2;
+  const scaleZ = uniformScale * 1.5; // Amplificador de profundidad (volumen)
   const wCX = _modelCenter.x;
   const wCY = _modelCenter.y + _modelSize.y * 0.06;
 
-  // ── Calcular XY, Z temporal (frente del modelo) ───────────
+  // ── Calcular XYZ reales (Geometría Intrínseca) ───────────
   const positions = new Float32Array(N * 3);
   const uvs       = new Float32Array(N * 2);
-  const RAY_Z = _modelCenter.z + _modelSize.z; // bien por delante
+
+  // Z base del rostro (frente de la cabeza)
+  const baseZ = _modelCenter.z + _modelSize.z * 0.42;
 
   for (let i = 0; i < N; i++) {
     const lm = landmarks[i];
     positions[i * 3 + 0] = (lm.x - faceCxN) * scaleX + wCX;
     positions[i * 3 + 1] = -(lm.y - faceCyN) * scaleY + wCY;
-    positions[i * 3 + 2] = RAY_Z;
+    // La profundidad real de MediaPipe (lm.z negativo es hacia afuera)
+    positions[i * 3 + 2] = baseZ + (-lm.z * scaleZ);
+
     uvs[i * 2 + 0] = lm.x;
-    uvs[i * 2 + 1] = 1.0 - lm.y;
-  }
-
-  // ── Raycasting: snapear cada vértice a la superficie ──────
-  // Ponemos la cabeza en rotación 0 para que las matrices de
-  // mundo coincidan con las posiciones XY calculadas arriba.
-  head.rotation.set(0, 0, 0);
-  head.updateWorldMatrix(true, true);
-
-  const headMeshes = [];
-  head.traverse(o => { if (o.isMesh) headMeshes.push(o); });
-
-  const fallbackZ = _modelCenter.z + _modelSize.z * 0.46;
-  const caster    = new THREE.Raycaster();
-  const dir       = new THREE.Vector3(0, 0, -1); // de +Z hacia cabeza
-  const ori       = new THREE.Vector3();
-
-  for (let i = 0; i < N; i++) {
-    ori.set(positions[i * 3], positions[i * 3 + 1], RAY_Z);
-    caster.set(ori, dir);
-
-    let surfaceZ = fallbackZ;
-    if (headMeshes.length > 0) {
-      const hits = caster.intersectObjects(headMeshes, false);
-      if (hits.length > 0) surfaceZ = hits[0].point.z;
-    }
-
-    // MediaPipe: lm.z negativo = más cerca de cámara (+Z en Three.js)
-    // → negamos para que nariz sobresalga, cuencas retrocedan
-    const depthOffset = (-landmarks[i].z) * _modelSize.z * 0.06;
-    positions[i * 3 + 2] = surfaceZ + depthOffset + 0.003;
+    uvs[i * 2 + 1] = lm.y;
   }
 
   // ── Geometría ─────────────────────────────────────────────
@@ -304,7 +296,7 @@ function _buildFaceMesh(landmarks, imgEl) {
   const photoCanvas = document.createElement('canvas');
   photoCanvas.width  = imgEl.naturalWidth  || 640;
   photoCanvas.height = imgEl.naturalHeight || 480;
-  photoCanvas.getContext('2d').drawImage(imgEl, 0, 0);
+  photoCanvas.getContext('2d', { willReadFrequently: true }).drawImage(imgEl, 0, 0);
   const photoTex = new THREE.CanvasTexture(photoCanvas);
   photoTex.colorSpace  = THREE.SRGBColorSpace;
   photoTex.flipY       = false;
@@ -318,26 +310,93 @@ function _buildFaceMesh(landmarks, imgEl) {
   // ── Normal map (detalle superficial desde foto) ─────────────
   const normalTex = _buildNormalMap(imgEl);
 
-  // ── Material PBR — polygonOffset evita z-fighting ─────────
-  const mat = new THREE.MeshStandardMaterial({
+  // ── Material PBR Físico (Piel Fotorrealista) ──────────────
+  const mat = new THREE.MeshPhysicalMaterial({
     map:                 photoTex,
     alphaMap:            alphaTex,
     normalMap:           normalTex,
-    normalScale:         new THREE.Vector2(0.4, 0.4),
-    transparent:         true,   // requerido para que alphaMap funcione
+    normalScale:         new THREE.Vector2(1.2, 1.2), // Más relieve
+    transparent:         true,   
     side:                THREE.FrontSide,
-    roughness:           0.72,
+    roughness:           0.45, // Piel refleja luz natural
     metalness:           0.0,
-    envMapIntensity:     0.4,
+    clearcoat:           0.3, // Capa brillante natural
+    clearcoatRoughness:  0.25,
+    sheen:               0.8, // Dispersión en bordes
+    sheenColor:          new THREE.Color(0xffdcb3),
+    envMapIntensity:     1.5,
     polygonOffset:       true,
     polygonOffsetFactor: -2,
     polygonOffsetUnits:  -2,
   });
 
+  // ── [Seamless Blend] Extraer color de piel y teñir cabeza base ──
+  _blendBaseHeadSkin(imgEl, landmarks, wCX, wCY, scaleX, scaleY);
+
   const mesh = new THREE.Mesh(geo, mat);
   mesh.name        = 'faceMesh3D';
   mesh.renderOrder = 1;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+
+  // ── Añadir UI Biométrica Holográfica ──
+  const ui = _buildLandmarkOverlay(geo);
+  if (ui) {
+    ui.name = 'biometricUI';
+    scene.add(ui);
+  }
+
   return mesh;
+}
+
+// ─── BLEND DE CABEZA BASE ─────────────────────────────────────
+
+function _blendBaseHeadSkin(imgEl, landmarks, wCX, wCY, scaleX, scaleY) {
+  if (!head) return;
+
+  const c = document.createElement('canvas');
+  c.width = imgEl.naturalWidth || 640;
+  c.height = imgEl.naturalHeight || 480;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(imgEl, 0, 0, c.width, c.height);
+
+  // Muestrear color promedio de nariz, frente y mejillas
+  const skinPoints = [1, 10, 234, 454];
+  let r = 0, g = 0, b = 0;
+  let validPoints = 0;
+  
+  try {
+    for (let idx of skinPoints) {
+      const lm = landmarks[idx];
+      const px = Math.floor(lm.x * c.width);
+      const py = Math.floor(lm.y * c.height);
+      const data = ctx.getImageData(px, py, 1, 1).data;
+      r += data[0]; g += data[1]; b += data[2];
+      validPoints++;
+    }
+  } catch (e) {
+    console.warn('[Avatar] CORS error sampling skin color, using fallback', e);
+  }
+
+  let skinColor;
+  if (validPoints > 0) {
+    skinColor = new THREE.Color((r/validPoints)/255, (g/validPoints)/255, (b/validPoints)/255);
+  } else {
+    skinColor = new THREE.Color(0.85, 0.70, 0.60); // Beige fallback
+  }
+  
+  head.traverse(o => {
+    if (o.isMesh && o !== _faceMesh3D) {
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      mats.forEach(m => {
+        if (!m) return;
+        m.map = null; // Remover la textura "maniquí" azul/gris
+        m.color.copy(skinColor); // Color piel promedio perfecto
+        m.roughness = 0.65;
+        m.needsUpdate = true;
+      });
+    }
+  });
 }
 
 // ─── MEJORAS DE GEMINI ────────────────────────────────────────
@@ -484,7 +543,7 @@ function loadPreset(idx) {
 
       head = new THREE.Group();
       head.add(model);
-      head.add(_buildLandmarkOverlay(c1, s1.x * 0.5, s1.y * 0.5, s1.z * 0.5));
+      // Opcional: _buildLandmarkOverlay(c1, s1.x * 0.5, s1.y * 0.5, s1.z * 0.5)
       scene.add(head);
 
       // Auto-frame cámara
@@ -544,17 +603,29 @@ async function _ensureMPLandmarker() {
 // ─── HELPERS ─────────────────────────────────────────────────
 
 function _removeFaceMesh() {
-  if (!_faceMesh3D) return;
-  if (head) head.remove(_faceMesh3D);
-  _faceMesh3D.geometry?.dispose();
-  const mat = _faceMesh3D.material;
-  if (mat) {
-    mat.map?.dispose();
-    mat.alphaMap?.dispose();
-    mat.normalMap?.dispose();
-    mat.dispose();
+  if (_faceMesh3D) {
+    if (head) head.remove(_faceMesh3D);
+    scene.remove(_faceMesh3D);
+    _faceMesh3D.geometry?.dispose();
+    const mat = _faceMesh3D.material;
+    if (mat) {
+      mat.map?.dispose();
+      mat.alphaMap?.dispose();
+      mat.normalMap?.dispose();
+      mat.dispose();
+    }
+    _faceMesh3D = null;
   }
-  _faceMesh3D = null;
+  
+  const ui = scene.getObjectByName('biometricUI');
+  if (ui) {
+    scene.remove(ui);
+    ui.children.forEach(c => {
+      c.geometry?.dispose();
+      if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
+      else c.material?.dispose();
+    });
+  }
 }
 
 // ─── ALPHA MAP (máscara oval con feathering) ──────────────────
@@ -567,27 +638,37 @@ function _buildAlphaMap(landmarks) {
   const AW = 128, AH = 128;
   const c = document.createElement('canvas');
   c.width = AW; c.height = AH;
-  const ctx = c.getContext('2d');
+  const ctx = c.getContext('2d', { willReadFrequently: true });
 
   // Fondo negro (transparente)
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, AW, AH);
 
-  // Polígono oval → blanco (opaco)
+  // Polígono oval encogido (blanco) para que el blur termine antes del borde de la geometría
   ctx.fillStyle = '#fff';
   ctx.beginPath();
+  
+  // Calcular centro de la cara para encoger hacia allí
+  let cx = 0, cy = 0;
+  FACE_OVAL.forEach(idx => { cx += landmarks[idx].x; cy += landmarks[idx].y; });
+  cx /= FACE_OVAL.length;
+  cy /= FACE_OVAL.length;
+
   FACE_OVAL.forEach((idx, i) => {
     const lm = landmarks[idx];
-    // Coordenadas de canvas: igual que imagen origen (y hacia abajo)
-    const px = lm.x * AW;
-    const py = lm.y * AH;
+    // Pull inwards by 12% to guarantee feathering before the mesh ends
+    const nx = cx + (lm.x - cx) * 0.88;
+    const ny = cy + (lm.y - cy) * 0.88;
+    
+    const px = nx * AW;
+    const py = ny * AH;
     if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
   });
   ctx.closePath();
   ctx.fill();
 
-  // Box-blur separable (radio 4, 3 pasadas) → bordes difuminados
-  _boxBlurCanvasCtx(ctx, AW, AH, 4, 3);
+  // Box-blur separable agresivo → bordes muy difuminados para transición suave
+  _boxBlurCanvasCtx(ctx, AW, AH, 12, 4);
 
   const tex = new THREE.CanvasTexture(c);
   tex.flipY     = false;
@@ -617,10 +698,10 @@ function _buildNormalMap(imgEl) {
   // Dibujar foto reducida
   const srcC = document.createElement('canvas');
   srcC.width = W; srcC.height = H;
-  srcC.getContext('2d').drawImage(imgEl, 0, 0, W, H);
+  srcC.getContext('2d', { willReadFrequently: true }).drawImage(imgEl, 0, 0, W, H);
 
   // Convertir a grises Float32
-  const rgba = srcC.getContext('2d').getImageData(0, 0, W, H).data;
+  const rgba = srcC.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data;
   const gray = new Float32Array(W * H);
   for (let i = 0; i < W * H; i++) {
     gray[i] = (0.299 * rgba[i * 4] + 0.587 * rgba[i * 4 + 1] + 0.114 * rgba[i * 4 + 2]) / 255;
@@ -632,7 +713,7 @@ function _buildNormalMap(imgEl) {
   // Sobel → normal map
   const dstC = document.createElement('canvas');
   dstC.width = W; dstC.height = H;
-  const dctx = dstC.getContext('2d');
+  const dctx = dstC.getContext('2d', { willReadFrequently: true });
   const imgD = dctx.createImageData(W, H);
   const d    = imgD.data;
   const STR  = 3.0; // amplitud del gradiente
@@ -743,24 +824,24 @@ function _boxBlurGray(src, W, H, radius, passes) {
 // ─── ILUMINACIÓN ─────────────────────────────────────────────
 
 function _addLights() {
-  _hemLight = new THREE.HemisphereLight(0x4A6880, 0x2A1810, 1.6);
+  _hemLight = new THREE.HemisphereLight(0x4A6880, 0x2A1810, 1.0);
   scene.add(_hemLight);
 
-  // Key light (frontal cálido)
-  const key = new THREE.DirectionalLight(0xFFF5EC, 4.2);
-  key.position.set(-2, 3, 5);
+  // Key light (frontal cálido cinematográfico)
+  const key = new THREE.DirectionalLight(0xFFE8D6, 5.0);
+  key.position.set(-3, 4, 6);
   key.castShadow = true;
-  key.shadow.mapSize.set(1024, 1024);
+  key.shadow.mapSize.set(2048, 2048);
   scene.add(key);
 
   // Fill (lateral frío)
-  const fill = new THREE.DirectionalLight(0xCCDDFF, 1.4);
-  fill.position.set(4, 0.5, 2);
+  const fill = new THREE.DirectionalLight(0xAACCF5, 2.0);
+  fill.position.set(4, 0, 3);
   scene.add(fill);
 
-  // Rim (contraluz)
-  const rim = new THREE.DirectionalLight(0x88AAFF, 3.0);
-  rim.position.set(0, 2, -8);
+  // Rim Light Agresivo (contraluz espectacular Cyan/Frío)
+  const rim = new THREE.DirectionalLight(0x66FFFF, 8.0);
+  rim.position.set(5, 3, -5);
   scene.add(rim);
 
   // Under (relleno inferior)
@@ -771,75 +852,43 @@ function _addLights() {
 
 // ─── OVERLAY HOLOGRÁFICO DE LANDMARKS ────────────────────────
 //
-//  35 puntos anatómicos + 44 aristas de estructura craneofacial.
-//  Colores HDR (luminancia > 3.5) → bloom selectivo cyan.
+//  Genera una red biométrica estilo Sci-Fi (Cyan) usando 
+//  los 468 nodos anatómicos proyectados por MediaPipe.
 //
-function _buildLandmarkOverlay(center, hw, hh, hd) {
-  const { x: cx, y: cy, z: cz } = center;
-  const ZOFF = 0.06;
+function _buildLandmarkOverlay(geo) {
+  if (!geo) return null;
 
-  const pts = [
-    [ 0.00,  0.80,  0.62], [-0.18,  0.76,  0.66], [ 0.18,  0.76,  0.66],
-    [-0.46,  0.48,  0.74], [-0.28,  0.44,  0.82], [-0.14,  0.42,  0.86],
-    [ 0.46,  0.48,  0.74], [ 0.28,  0.44,  0.82], [ 0.14,  0.42,  0.86],
-    [-0.36,  0.32,  0.84], [-0.18,  0.30,  0.88],
-    [ 0.36,  0.32,  0.84], [ 0.18,  0.30,  0.88],
-    [ 0.00,  0.20,  0.94], [ 0.00,  0.06,  0.96],
-    [ 0.00, -0.04,  0.98], [-0.12, -0.11,  0.93], [ 0.12, -0.11,  0.93],
-    [-0.20, -0.24,  0.88], [ 0.20, -0.24,  0.88],
-    [ 0.00, -0.20,  0.93], [ 0.00, -0.32,  0.90],
-    [ 0.00, -0.56,  0.74], [-0.10, -0.50,  0.78], [ 0.10, -0.50,  0.78],
-    [-0.52,  0.40,  0.66], [-0.58,  0.14,  0.58],
-    [-0.56, -0.10,  0.56], [-0.44, -0.42,  0.64],
-    [ 0.52,  0.40,  0.66], [ 0.58,  0.14,  0.58],
-    [ 0.56, -0.10,  0.56], [ 0.44, -0.42,  0.64],
-    [-0.46,  0.06,  0.73], [ 0.46,  0.06,  0.73],
-  ];
+  const group = new THREE.Group();
 
-  const buf = new Float32Array(pts.length * 3);
-  pts.forEach(([fx, fy, fz], i) => {
-    buf[i * 3]     = cx + fx * hw;
-    buf[i * 3 + 1] = cy + fy * hh;
-    buf[i * 3 + 2] = cz + fz * hd + ZOFF;
+  // 1. Nodos Biométricos (Cyan Bloom)
+  const dotMat = new THREE.PointsMaterial({
+    color: 0x00FFFF, 
+    size: 0.015,
+    transparent: true,
+    opacity: 0.9,
+    blending: THREE.AdditiveBlending, 
+    depthWrite: false
   });
+  const dots = new THREE.Points(geo, dotMat);
+  group.add(dots);
 
-  const dGeo = new THREE.BufferGeometry();
-  dGeo.setAttribute('position', new THREE.BufferAttribute(buf, 3));
-  const dots = new THREE.Points(dGeo, new THREE.PointsMaterial({
-    color: new THREE.Color().setRGB(0, 7, 8),
-    size: 0.045, sizeAttenuation: true,
-    transparent: true, opacity: 0.90, depthWrite: false,
-  }));
+  // 2. Wireframe / Red Geométrica
+  const wireMat = new THREE.LineBasicMaterial({
+    color: 0x00FFFF,
+    transparent: true,
+    opacity: 0.25,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+  
+  const wireGeo = new THREE.WireframeGeometry(geo);
+  const wire = new THREE.LineSegments(wireGeo, wireMat);
+  group.add(wire);
 
-  const EDGES = [
-    [25,26],[26,27],[27,28],[28,23],
-    [29,30],[30,31],[31,32],[32,24],
-    [25, 3],[ 3, 1],[ 1, 0],[ 0, 2],[ 2, 6],[ 6,29],
-    [ 3, 4],[ 4, 5],[ 6, 7],[ 7, 8],
-    [ 3, 9],[ 6,11],[ 9,10],[11,12],
-    [ 5,13],[ 8,13],[10,13],[12,13],
-    [13,14],[14,15],[15,16],[15,17],
-    [ 9,33],[11,34],[33,26],[34,30],
-    [33,18],[34,19],[16,18],[17,19],
-    [18,20],[20,19],[18,21],[21,19],
-    [18,23],[19,24],[23,22],[24,22],
-    [28,22],[32,22],[ 0,13],[20,15],
-  ];
+  // Pequeño offset Z para evitar Z-Fighting con la piel
+  group.position.z += 0.005;
 
-  const lGeo = new THREE.BufferGeometry();
-  lGeo.setAttribute('position', new THREE.BufferAttribute(buf.slice(), 3));
-  lGeo.setIndex(new THREE.BufferAttribute(
-    new Uint16Array(EDGES.flatMap(([a, b]) => [a, b])), 1,
-  ));
-  const lines = new THREE.LineSegments(lGeo, new THREE.LineBasicMaterial({
-    color: new THREE.Color().setRGB(0, 5, 5.5),
-    transparent: true, opacity: 0.45, depthWrite: false,
-  }));
-
-  const g = new THREE.Group();
-  g.add(dots);
-  g.add(lines);
-  return g;
+  return group;
 }
 
 // ─── RENDER LOOP ─────────────────────────────────────────────

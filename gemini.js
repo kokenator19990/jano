@@ -4,7 +4,7 @@
 //  para enriquecer la reconstrucción de malla facial.
 // ============================================================
 
-const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_MODEL = 'gemini-1.5-pro';
 const GEMINI_URL   = (key) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
 
