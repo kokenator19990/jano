@@ -1,5 +1,5 @@
 // ================================================================
-//  FaceLab Analytics — 3D Digital Clone System  v4.0
+//  FaceLab Analytics — 3D Digital Clone System  v7.0
 //  Three.js r162 · MediaPipe 468-pt mesh · Gemini AI Vision
 //
 //  Pipeline de reconstrucción facial:
@@ -31,6 +31,7 @@ import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { BokehPass }       from 'three/addons/postprocessing/BokehPass.js';
 import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { FACES }           from './geometry.js';   // 936 triangles × 3 = 2808 indices
 import { analyzeWithGemini } from './gemini.js';
 
@@ -140,6 +141,11 @@ export function init(canvas) {
   composer.addPass(new OutputPass());
 
   _addLights();
+
+  // Environment map procedural (studio HDRI para reflejos realistas de piel)
+  const pmremGenerator = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+  pmremGenerator.dispose();
 
   controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;
@@ -294,11 +300,17 @@ function _buildFaceMesh(landmarks, imgEl) {
     uvs[i * 2 + 1] = lm.y;
   }
 
+  // ── Raycasting: conformar Z a la superficie del cráneo ──
+  _conformToSurface(positions, N, landmarks, scaleZ);
+
   // ── Geometría ─────────────────────────────────────────────
-  const geo = new THREE.BufferGeometry();
+  let geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geo.setAttribute('uv',       new THREE.BufferAttribute(uvs, 2));
   geo.setIndex(new THREE.BufferAttribute(new Uint16Array(FACES), 1));
+
+  // ── Subdivisión: suavizado de malla (936 → 3744 triángulos) ──
+  geo = _subdivideGeometry(geo);
   geo.computeVertexNormals();
 
   // ── Textura foto del paciente ──────────────────────────────
@@ -319,21 +331,24 @@ function _buildFaceMesh(landmarks, imgEl) {
   // ── Normal map (detalle superficial desde foto) ─────────────
   const normalTex = _buildNormalMap(imgEl);
 
-  // ── Material PBR Físico (Piel Fotorrealista) ──────────────
+  // ── Material PBR Físico (Piel Fotorrealista PS5-grade) ─────
   const mat = new THREE.MeshPhysicalMaterial({
     map:                 photoTex,
     alphaMap:            alphaTex,
     normalMap:           normalTex,
-    normalScale:         new THREE.Vector2(1.2, 1.2), // Más relieve
-    transparent:         true,   
+    normalScale:         new THREE.Vector2(1.0, 1.0),
+    transparent:         true,
     side:                THREE.FrontSide,
-    roughness:           0.45, // Piel refleja luz natural
+    roughness:           0.52,
     metalness:           0.0,
-    clearcoat:           0.3, // Capa brillante natural
-    clearcoatRoughness:  0.25,
-    sheen:               0.8, // Dispersión en bordes
-    sheenColor:          new THREE.Color(0xffdcb3),
-    envMapIntensity:     1.5,
+    clearcoat:           0.12,
+    clearcoatRoughness:  0.45,
+    sheen:               0.5,
+    sheenRoughness:      0.4,
+    sheenColor:          new THREE.Color(0xffd4b0),
+    specularIntensity:   0.35,
+    specularColor:       new THREE.Color(0xffeedd),
+    envMapIntensity:     0.8,
     polygonOffset:       true,
     polygonOffsetFactor: -2,
     polygonOffsetUnits:  -2,
@@ -839,6 +854,125 @@ function _boxBlurGray(src, W, H, radius, passes) {
   return a;
 }
 
+// ─── CONFORMAR SUPERFICIE (RAYCASTING) ──────────────────────
+//
+//  Dispara un rayo desde +Z (frente) hacia −Z por cada vértice
+//  de la malla facial. Si impacta la superficie del cráneo GLB,
+//  ajusta la posición Z del vértice para que descanse exactamente
+//  sobre la superficie + offset + profundidad MediaPipe.
+//
+function _conformToSurface(positions, N, landmarks, scaleZ) {
+  if (!head) return;
+
+  // Recolectar meshes del modelo base (no la cara)
+  const headMeshes = [];
+  head.traverse(o => {
+    if (o.isMesh && o.name !== 'faceMesh3D') headMeshes.push(o);
+  });
+  if (headMeshes.length === 0) return;
+
+  // Asegurar matrices actualizadas
+  head.updateWorldMatrix(true, true);
+
+  const raycaster = new THREE.Raycaster();
+  const localDir  = new THREE.Vector3(0, 0, -1);
+
+  for (let i = 0; i < N; i++) {
+    const x = positions[i * 3];
+    const y = positions[i * 3 + 1];
+
+    // Origen del rayo en espacio local del head (frente del modelo)
+    const origin = new THREE.Vector3(x, y, 3.0);
+
+    // Convertir a espacio mundo para raycasting
+    const worldOrigin = origin.clone().applyMatrix4(head.matrixWorld);
+    const worldDir    = localDir.clone().transformDirection(head.matrixWorld);
+
+    raycaster.set(worldOrigin, worldDir);
+
+    const hits = raycaster.intersectObjects(headMeshes, true);
+    if (hits.length > 0) {
+      // Convertir punto de impacto de vuelta a espacio local del head
+      const hitLocal = head.worldToLocal(hits[0].point.clone());
+
+      // Z final = superficie del cráneo + offset + profundidad relativa de MediaPipe
+      const mpDepth = -landmarks[i].z * scaleZ * 0.15;
+      positions[i * 3 + 2] = hitLocal.z + 0.003 + mpDepth;
+    }
+  }
+}
+
+// ─── SUBDIVISIÓN DE MALLA (Midpoint) ────────────────────────
+//
+//  Divide cada triángulo en 4 sub-triángulos insertando vértices
+//  en el punto medio de cada arista. No cambia la forma, solo
+//  aumenta la resolución → normales más suaves, menos facetado.
+//
+//  468 vértices → ~1870 vértices
+//  936 triángulos → 3744 triángulos
+//
+function _subdivideGeometry(geo) {
+  const posAttr = geo.getAttribute('position');
+  const uvAttr  = geo.getAttribute('uv');
+  const index   = geo.getIndex();
+  if (!posAttr || !uvAttr || !index) return geo;
+
+  const srcPos    = posAttr.array;
+  const srcUV     = uvAttr.array;
+  const srcIdx    = index.array;
+  const triCount  = srcIdx.length / 3;
+
+  // Copiar vértices existentes
+  const newPos = Array.from(srcPos);
+  const newUV  = Array.from(srcUV);
+  let nextVert = posAttr.count;
+
+  // Cache de aristas: "min_max" → índice del vértice medio
+  const edgeMap = new Map();
+
+  function midpoint(a, b) {
+    const key = Math.min(a, b) + '_' + Math.max(a, b);
+    if (edgeMap.has(key)) return edgeMap.get(key);
+
+    const idx = nextVert++;
+    newPos.push(
+      (srcPos[a * 3]     + srcPos[b * 3])     / 2,
+      (srcPos[a * 3 + 1] + srcPos[b * 3 + 1]) / 2,
+      (srcPos[a * 3 + 2] + srcPos[b * 3 + 2]) / 2,
+    );
+    newUV.push(
+      (srcUV[a * 2]     + srcUV[b * 2])     / 2,
+      (srcUV[a * 2 + 1] + srcUV[b * 2 + 1]) / 2,
+    );
+    edgeMap.set(key, idx);
+    return idx;
+  }
+
+  const newIdx = [];
+  for (let t = 0; t < triCount; t++) {
+    const i0  = srcIdx[t * 3];
+    const i1  = srcIdx[t * 3 + 1];
+    const i2  = srcIdx[t * 3 + 2];
+    const m01 = midpoint(i0, i1);
+    const m12 = midpoint(i1, i2);
+    const m20 = midpoint(i2, i0);
+
+    // 4 sub-triángulos preservando winding order
+    newIdx.push(i0,  m01, m20);
+    newIdx.push(m01, i1,  m12);
+    newIdx.push(m20, m12, i2);
+    newIdx.push(m01, m12, m20);
+  }
+
+  const subdGeo = new THREE.BufferGeometry();
+  subdGeo.setAttribute('position', new THREE.Float32BufferAttribute(newPos, 3));
+  subdGeo.setAttribute('uv',       new THREE.Float32BufferAttribute(newUV, 2));
+  subdGeo.setIndex(newIdx);
+
+  geo.dispose();
+  return subdGeo;
+}
+
 // ─── ILUMINACIÓN ─────────────────────────────────────────────
 
 function _addLights() {
@@ -868,80 +1002,118 @@ function _addLights() {
   scene.add(under);
 }
 
-// ─── OVERLAY HOLOGRÁFICO DE LANDMARKS ────────────────────────
+// ─── OVERLAY HOLOGRÁFICO ANATÓMICO ──────────────────────────
 //
-//  Genera una red biométrica estilo Sci-Fi (Cyan) limpia y minimalista,
-//  idéntica a la imagen de referencia.
+//  Genera una red biométrica estilo Sci-Fi (Cyan) basada en
+//  recorridos anatómicos reales: contornos de mandíbula, órbitas
+//  oculares, arcos superciliares, puente nasal, labios y líneas
+//  de medición craneométrica.
 //
 function _buildLandmarkOverlay(geo, positionsArray) {
-  if (!geo || !positionsArray) return null;
+  if (!positionsArray) return null;
 
   const group = new THREE.Group();
 
-  // 1. Extraer subconjunto de nodos para un look "limpio" (aprox 40 puntos)
-  const sparseIndices = [
-    10, 109, 338, 21, 251, 33, 263, 1, 61, 291, 152, 234, 454,
-    103, 332, 67, 297, 101, 330, 50, 280, 119, 348, 147, 376,
-    205, 425, 207, 427, 214, 434, 212, 432, 138, 367, 135, 364
+  // ── Contornos anatómicos (recorridos conectados) ──────────
+  const BIO_PATHS = [
+    // Mandíbula / FACE_OVAL
+    [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+     397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+     172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10],
+    // Ojo izquierdo
+    [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246, 33],
+    // Ojo derecho
+    [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398, 362],
+    // Ceja izquierda
+    [70, 63, 105, 66, 107, 55, 65, 52, 53, 46],
+    // Ceja derecha
+    [300, 293, 334, 296, 336, 285, 295, 282, 283, 276],
+    // Puente nasal
+    [168, 6, 197, 195, 5, 4, 1],
+    // Base nasal
+    [129, 98, 97, 2, 326, 327, 358],
+    // Labios exteriores
+    [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146, 61],
   ];
 
-  const sparsePositions = [];
-  sparseIndices.forEach(idx => {
-    sparsePositions.push(
-      positionsArray[idx * 3],
-      positionsArray[idx * 3 + 1],
-      positionsArray[idx * 3 + 2]
-    );
-  });
+  // ── Líneas craneométricas (medición biométrica) ───────────
+  const BIO_MEASURES = [
+    [234, 50, 1, 280, 454],   // Bi-zigomático (mejilla a mejilla)
+    [127, 10, 356],            // Bi-temporal (sien a sien)
+    [33, 168, 263],            // Bi-cantal (ojo a ojo por puente)
+    [10, 168, 1, 152],         // Línea media vertical (frente → mentón)
+  ];
 
-  const pGeo = new THREE.BufferGeometry();
-  pGeo.setAttribute('position', new THREE.Float32BufferAttribute(sparsePositions, 3));
+  // ── Nodos biométricos clave ───────────────────────────────
+  const BIO_NODES = [
+    10, 152, 234, 454,         // Cardinales del rostro
+    33, 133, 263, 362,         // Esquinas oculares
+    1, 4, 6, 168,              // Nariz: punta, dorso, puente
+    61, 291,                   // Comisuras labiales
+    105, 334,                  // Picos superciliares
+    127, 356,                  // Temporales
+    50, 280,                   // Pómulos
+    175, 199,                  // Laterales del mentón
+  ];
 
-  // Nodos Biométricos (Cyan Bloom)
-  const dotMat = new THREE.PointsMaterial({
-    color: 0x00FFFF, 
-    size: 0.012,
-    transparent: true,
-    opacity: 0.95,
-    blending: THREE.AdditiveBlending, 
-    depthWrite: false
-  });
-  const dots = new THREE.Points(pGeo, dotMat);
-  group.add(dots);
+  // Posición desde el array original (índices 0-467)
+  const p = (idx) => [
+    positionsArray[idx * 3],
+    positionsArray[idx * 3 + 1],
+    positionsArray[idx * 3 + 2],
+  ];
 
-  // 2. Crear conexiones (Wireframe) calculando vecinos cercanos
-  const edges = [];
-  const MAX_DIST = 0.45; // Conectar si están relativamente cerca
-  
-  for (let i = 0; i < sparseIndices.length; i++) {
-    const x1 = sparsePositions[i*3], y1 = sparsePositions[i*3+1], z1 = sparsePositions[i*3+2];
-    let connected = 0;
-    for (let j = i + 1; j < sparseIndices.length; j++) {
-      const x2 = sparsePositions[j*3], y2 = sparsePositions[j*3+1], z2 = sparsePositions[j*3+2];
-      const dist = Math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2);
-      if (dist < MAX_DIST && connected < 3) {
-        edges.push(x1, y1, z1, x2, y2, z2);
-        connected++;
-      }
+  // ── Construir líneas de contorno ──────────────────────────
+  const lineVerts = [];
+
+  BIO_PATHS.forEach(path => {
+    for (let i = 0; i < path.length - 1; i++) {
+      const a = p(path[i]), b = p(path[i + 1]);
+      lineVerts.push(a[0], a[1], a[2], b[0], b[1], b[2]);
     }
+  });
+
+  BIO_MEASURES.forEach(path => {
+    for (let i = 0; i < path.length - 1; i++) {
+      const a = p(path[i]), b = p(path[i + 1]);
+      lineVerts.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+    }
+  });
+
+  if (lineVerts.length > 0) {
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(lineVerts, 3));
+    const lineMat = new THREE.LineBasicMaterial({
+      color: 0x00FFFF,
+      transparent: true,
+      opacity: 0.35,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    group.add(new THREE.LineSegments(lineGeo, lineMat));
   }
 
-  const lineGeo = new THREE.BufferGeometry();
-  lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(edges, 3));
-  
-  const wireMat = new THREE.LineBasicMaterial({
-    color: 0x00FFFF,
-    transparent: true,
-    opacity: 0.4,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false
+  // ── Nodos clave (puntos) ──────────────────────────────────
+  const nodePos = [];
+  BIO_NODES.forEach(idx => {
+    const v = p(idx);
+    nodePos.push(v[0], v[1], v[2]);
   });
-  
-  const wire = new THREE.LineSegments(lineGeo, wireMat);
-  group.add(wire);
 
-  // Pequeño offset Z para evitar Z-Fighting
-  group.position.z += 0.005;
+  const nodeGeo = new THREE.BufferGeometry();
+  nodeGeo.setAttribute('position', new THREE.Float32BufferAttribute(nodePos, 3));
+  const nodeMat = new THREE.PointsMaterial({
+    color: 0x00FFFF,
+    size: 0.018,
+    transparent: true,
+    opacity: 0.9,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  group.add(new THREE.Points(nodeGeo, nodeMat));
+
+  // Z offset para evitar z-fighting con la malla facial
+  group.position.z += 0.006;
 
   return group;
 }
