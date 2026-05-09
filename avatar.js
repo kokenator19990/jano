@@ -178,7 +178,7 @@ export async function applyPhoto(imgEl) {
     return;
   }
 
-  _setStatus('Reconstruyendo malla facial 3D...', true);
+  _setStatus('Conformando malla a superficie 3D...', true);
 
   const faceMesh = _buildFaceMesh(landmarks, imgEl);
   head.add(faceMesh);
@@ -206,99 +206,117 @@ export async function applyPhoto(imgEl) {
 
 // ─── CONSTRUIR MALLA FACIAL 3D ───────────────────────────────
 //
-//  Convierte los 468 landmarks MediaPipe en una THREE.BufferGeometry
-//  correctamente ubicada en el espacio 3D del modelo.
+//  Pipeline de 2 pasos:
 //
-//  Vértices: escalados para que la cara llene el frente del modelo.
-//  UVs:      coordenadas (x, y) del landmark en la foto — mapea
-//            directamente los píxeles correctos de la foto a cada
-//            vértice de la malla. Resultado: textura perfectamente
-//            alineada con la geometría real del rostro.
+//  1. POSICIONES XY — escaladas desde los 468 landmarks de MediaPipe
+//     para que la cara ocupe FACE_W/H_RATIO del frente del modelo.
+//
+//  2. POSICIÓN Z — raycasting: para cada vértice se dispara un rayo
+//     desde delante del modelo en dirección -Z. El punto de impacto
+//     en la superficie del modelo 3D determina la Z exacta del
+//     vértice → la malla se adhiere a la curvatura real del modelo.
+//     Se añade la profundidad relativa de MediaPipe encima (negada:
+//     en MediaPipe z negativo = más cerca de la cámara, que en
+//     Three.js es +Z, así que invertimos el signo).
 //
 function _buildFaceMesh(landmarks, imgEl) {
   const N = 468;
 
-  // ── Bounding box de los landmarks en espacio normalizado ─────
+  // ── BBox de landmarks en espacio normalizado ──────────────
   let lx0 = 1, ly0 = 1, lx1 = 0, ly1 = 0;
   for (let i = 0; i < N; i++) {
     const lm = landmarks[i];
-    if (lm.x < lx0) lx0 = lm.x;
-    if (lm.y < ly0) ly0 = lm.y;
-    if (lm.x > lx1) lx1 = lm.x;
-    if (lm.y > ly1) ly1 = lm.y;
+    if (lm.x < lx0) lx0 = lm.x; if (lm.y < ly0) ly0 = lm.y;
+    if (lm.x > lx1) lx1 = lm.x; if (lm.y > ly1) ly1 = lm.y;
   }
-
-  const faceCxN = (lx0 + lx1) / 2;
-  const faceCyN = (ly0 + ly1) / 2;
+  const faceCxN = (lx0 + lx1) / 2, faceCyN = (ly0 + ly1) / 2;
   const faceWN  = Math.max(lx1 - lx0, 0.01);
   const faceHN  = Math.max(ly1 - ly0, 0.01);
 
-  // ── Escala para que la malla llene el frente del modelo ──────
+  // ── Escala XY ─────────────────────────────────────────────
   const scaleX = (_modelSize.x * FACE_W_RATIO) / faceWN;
   const scaleY = (_modelSize.y * FACE_H_RATIO) / faceHN;
-  // Z: MediaPipe da profundidad relativa; la escalamos para que
-  //    la variación de profundidad sea visible pero no exagerada
-  const scaleZ = _modelSize.z * 0.32;
-
-  // Centro de la cara en world space (ligeramente por encima del
-  // centro del modelo, que incluye cuello)
   const wCX = _modelCenter.x;
   const wCY = _modelCenter.y + _modelSize.y * 0.06;
-  const wCZ = _modelCenter.z + _modelSize.z * FACE_Z_RATIO;
 
-  // ── Arrays de geometría ──────────────────────────────────────
+  // ── Calcular XY, Z temporal (frente del modelo) ───────────
   const positions = new Float32Array(N * 3);
   const uvs       = new Float32Array(N * 2);
+  const RAY_Z = _modelCenter.z + _modelSize.z; // bien por delante
 
   for (let i = 0; i < N; i++) {
     const lm = landmarks[i];
-
-    // Posición 3D en world space
     positions[i * 3 + 0] = (lm.x - faceCxN) * scaleX + wCX;
     positions[i * 3 + 1] = -(lm.y - faceCyN) * scaleY + wCY;
-    positions[i * 3 + 2] = lm.z * scaleZ + wCZ;
-
-    // UV: coordenadas del landmark en la imagen original
-    // Mapeo directo → cada vértice muestrea su píxel exacto en la foto
+    positions[i * 3 + 2] = RAY_Z;
     uvs[i * 2 + 0] = lm.x;
-    uvs[i * 2 + 1] = 1.0 - lm.y; // Y invertido (Three.js UV origin = bottom-left)
+    uvs[i * 2 + 1] = 1.0 - lm.y;
   }
 
-  // ── Geometría ────────────────────────────────────────────────
+  // ── Raycasting: snapear cada vértice a la superficie ──────
+  // Ponemos la cabeza en rotación 0 para que las matrices de
+  // mundo coincidan con las posiciones XY calculadas arriba.
+  head.rotation.set(0, 0, 0);
+  head.updateWorldMatrix(true, true);
+
+  const headMeshes = [];
+  head.traverse(o => { if (o.isMesh) headMeshes.push(o); });
+
+  const fallbackZ = _modelCenter.z + _modelSize.z * 0.46;
+  const caster    = new THREE.Raycaster();
+  const dir       = new THREE.Vector3(0, 0, -1); // de +Z hacia cabeza
+  const ori       = new THREE.Vector3();
+
+  for (let i = 0; i < N; i++) {
+    ori.set(positions[i * 3], positions[i * 3 + 1], RAY_Z);
+    caster.set(ori, dir);
+
+    let surfaceZ = fallbackZ;
+    if (headMeshes.length > 0) {
+      const hits = caster.intersectObjects(headMeshes, false);
+      if (hits.length > 0) surfaceZ = hits[0].point.z;
+    }
+
+    // MediaPipe: lm.z negativo = más cerca de cámara (+Z en Three.js)
+    // → negamos para que nariz sobresalga, cuencas retrocedan
+    const depthOffset = (-landmarks[i].z) * _modelSize.z * 0.06;
+    positions[i * 3 + 2] = surfaceZ + depthOffset + 0.003;
+  }
+
+  // ── Geometría ─────────────────────────────────────────────
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geo.setAttribute('uv',       new THREE.BufferAttribute(uvs, 2));
   geo.setIndex(new THREE.BufferAttribute(new Uint16Array(FACES), 1));
   geo.computeVertexNormals();
 
-  // ── Textura de la foto ───────────────────────────────────────
+  // ── Textura foto del paciente ──────────────────────────────
   const photoCanvas = document.createElement('canvas');
   photoCanvas.width  = imgEl.naturalWidth  || 640;
   photoCanvas.height = imgEl.naturalHeight || 480;
   photoCanvas.getContext('2d').drawImage(imgEl, 0, 0);
-
   const photoTex = new THREE.CanvasTexture(photoCanvas);
   photoTex.colorSpace  = THREE.SRGBColorSpace;
-  photoTex.flipY       = false; // Ya invertimos Y en los UVs
+  photoTex.flipY       = false;
   photoTex.minFilter   = THREE.LinearFilter;
   photoTex.magFilter   = THREE.LinearFilter;
   photoTex.needsUpdate = true;
 
-  // ── Material PBR con textura de foto ─────────────────────────
+  // ── Material PBR — polygonOffset evita z-fighting ─────────
   const mat = new THREE.MeshStandardMaterial({
-    map:         photoTex,
-    side:        THREE.FrontSide,
-    roughness:   0.72,
-    metalness:   0.0,
-    envMapIntensity: 0.4,
+    map:                 photoTex,
+    side:                THREE.FrontSide,
+    roughness:           0.72,
+    metalness:           0.0,
+    envMapIntensity:     0.4,
+    polygonOffset:       true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits:  -2,
   });
 
   const mesh = new THREE.Mesh(geo, mat);
-  mesh.name = 'faceMesh3D';
-
-  // Offset mínimo para evitar z-fighting con el modelo base
+  mesh.name        = 'faceMesh3D';
   mesh.renderOrder = 1;
-
   return mesh;
 }
 
